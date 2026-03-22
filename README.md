@@ -120,9 +120,6 @@ See the Quick Start section above.
 
 This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
 
-## Contributing
-
-Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.
 
 ## Acknowledgments
 
