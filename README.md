@@ -104,10 +104,6 @@ Key fields:
 - `routing_preference`
 - `objective_weights`
 
-## Algorithm Details
-
-The full design and optimization flow is documented in `docs/algorithm.md`.
-
 ## Installation
 
 ```bash
