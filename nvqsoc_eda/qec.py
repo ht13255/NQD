@@ -92,6 +92,62 @@ def estimate_required_physical_qubits(spec: DesignSpec) -> tuple[str, int, int]:
     return best_family, best_distance, best_total
 
 
+def estimate_qec_feasibility_precheck(spec: DesignSpec) -> dict[str, Any]:
+    gate_error = max(1.0 - spec.target_gate_fidelity, 1e-6)
+    readout_error = max(1.0 - spec.target_readout_fidelity, 1e-6)
+    p_phys_est = max(1e-6, min(0.18, 0.64 * gate_error + 0.10 * readout_error + 0.002 + 0.0003 * spec.target_logical_qubits))
+    family_names = list(QEC_LIBRARY) if spec.qec_code == "auto" or spec.qec_code not in QEC_LIBRARY else [spec.qec_code]
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    feasible_families = 0
+    for family in family_names:
+        cfg = QEC_LIBRARY[family]
+        distance = _required_distance(spec.target_logical_error_rate, p_phys_est, cfg["threshold"], cfg["alpha"])
+        physical_per_logical = max(9, int(cfg["qubits_per_distance"](distance)))
+        factory_count, factory_qubits = _estimate_factory_resources(spec, family, distance, spec.target_logical_qubits)
+        total_required = spec.target_logical_qubits * physical_per_logical + factory_qubits
+        projected_logical_error = _logical_error_rate(cfg["alpha"], p_phys_est, cfg["threshold"], distance)
+        feasible_by_qubits = spec.target_qubits >= total_required
+        feasible_by_error = projected_logical_error <= spec.target_logical_error_rate
+        if feasible_by_qubits and feasible_by_error:
+            feasible_families += 1
+        rows.append(
+            {
+                "code_family": family,
+                "estimated_physical_error_rate": p_phys_est,
+                "threshold": cfg["threshold"],
+                "recommended_distance": distance,
+                "theoretical_physical_qubits_per_logical": physical_per_logical,
+                "factory_count": factory_count,
+                "factory_qubits_total": factory_qubits,
+                "estimated_total_required_qubits": total_required,
+                "projected_logical_error_rate": projected_logical_error,
+                "meets_qubit_budget": feasible_by_qubits,
+                "meets_error_budget": feasible_by_error,
+            }
+        )
+        if not feasible_by_qubits:
+            warnings.append(
+                f"{family} d={distance} needs about {total_required} physical qubits, above requested target budget {spec.target_qubits}"
+            )
+        if not feasible_by_error:
+            warnings.append(
+                f"{family} d={distance} projects logical error {projected_logical_error:.3e}, above target {spec.target_logical_error_rate:.3e}"
+            )
+    if spec.qec_enabled and feasible_families == 0:
+        warnings.append("no configured QEC family simultaneously meets the requested physical-qubit budget and logical error budget before search")
+    rows.sort(key=lambda item: (item["meets_qubit_budget"] and item["meets_error_budget"], -item["recommended_distance"], -item["estimated_total_required_qubits"]), reverse=True)
+    return {
+        "qec_enabled": spec.qec_enabled,
+        "requested_target_qubits": spec.target_qubits,
+        "requested_target_logical_qubits": spec.target_logical_qubits,
+        "requested_target_logical_error_rate": spec.target_logical_error_rate,
+        "estimated_physical_error_rate": p_phys_est,
+        "families": rows,
+        "warnings": list(dict.fromkeys(warnings)),
+    }
+
+
 @dataclass(slots=True)
 class LogicalPatch:
     logical_id: int
@@ -225,6 +281,11 @@ class QECPlan:
     average_patch_idle_ns: float
     factory_utilization: float
     decoder_utilization: float
+    physical_qubits_per_target_logical: float
+    theoretical_physical_qubits_per_logical: int
+    estimated_required_total_qubits: int
+    escalation_rule_triggered: bool = False
+    escalated_distance_candidate: int = 0
     patches: list[LogicalPatch] = field(default_factory=list)
     surgery_channels: list[LatticeSurgeryChannel] = field(default_factory=list)
     magic_state_factories: list[MagicStateFactory] = field(default_factory=list)
@@ -232,6 +293,7 @@ class QECPlan:
     logical_schedule: list[LogicalOperation] = field(default_factory=list)
     factory_timelines: list[FactoryTimelineEntry] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
+    feasibility_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe({
@@ -309,6 +371,13 @@ def _factory_count(spec: DesignSpec, target_logicals: int) -> int:
 def _factory_qubits(code_family: str, distance: int) -> int:
     lib = QEC_LIBRARY[code_family]
     return max(12, int(round(lib["factory_scale"] * lib["qubits_per_distance"](distance))))
+
+
+def estimate_distance_resources(spec: DesignSpec, code_family: str, distance: int) -> tuple[int, int, int]:
+    physical_per_logical = max(9, int(QEC_LIBRARY[code_family]["qubits_per_distance"](distance)))
+    _factory_count_value, factory_qubits_total = _estimate_factory_resources(spec, code_family, distance, spec.target_logical_qubits)
+    total_required = spec.target_logical_qubits * physical_per_logical + factory_qubits_total
+    return physical_per_logical, factory_qubits_total, total_required
 
 
 def _estimate_factory_resources(spec: DesignSpec, code_family: str, distance: int, target_logicals: int) -> tuple[int, int]:
@@ -683,8 +752,35 @@ def _decoder_locality_score(patches: list[LogicalPatch], channels: list[LatticeS
     return max(0.0, min(1.0, 1.12 - 0.09 * cluster_penalty - channel_penalty / 1500.0))
 
 
+def _feasibility_warnings(
+    spec: DesignSpec,
+    candidate: CandidateDesign,
+    code_family: str,
+    code_distance: int,
+    physical_per_logical: int,
+    total_required: int,
+) -> tuple[float, list[str]]:
+    target_logicals = max(spec.target_logical_qubits, 1)
+    actual_physical_per_target_logical = candidate.qubits / target_logicals
+    warnings: list[str] = []
+    if actual_physical_per_target_logical < physical_per_logical:
+        warnings.append(
+            f"allocated physical qubits per target logical ({actual_physical_per_target_logical:.1f}) fall below `{code_family}` d={code_distance} theoretical need ({physical_per_logical})"
+        )
+    if candidate.qubits < total_required:
+        warnings.append(
+            f"candidate qubit budget ({candidate.qubits}) is below estimated QEC requirement ({total_required}) for `{code_family}` d={code_distance}"
+        )
+    if actual_physical_per_target_logical < 24.0:
+        warnings.append(
+            f"physical qubits per logical ({actual_physical_per_target_logical:.1f}) are below the legacy 24-qubit heuristic and should be treated as feasibility-risky"
+        )
+    return actual_physical_per_target_logical, warnings
+
+
 def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: SimulationMetrics, dense_signals: FastDenseSignals | None = None) -> QECPlan:
     if not spec.qec_enabled:
+        actual_physical_per_target_logical = candidate.qubits / max(spec.target_logical_qubits, 1)
         return QECPlan(
             enabled=False,
             code_family=spec.qec_code,
@@ -716,6 +812,11 @@ def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: Simula
             average_patch_idle_ns=0.0,
             factory_utilization=0.0,
             decoder_utilization=0.0,
+            physical_qubits_per_target_logical=actual_physical_per_target_logical,
+            theoretical_physical_qubits_per_logical=1,
+            estimated_required_total_qubits=spec.target_logical_qubits,
+            escalation_rule_triggered=False,
+            escalated_distance_candidate=0,
             patches=[
                 LogicalPatch(
                     logical_id=i,
@@ -740,6 +841,7 @@ def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: Simula
             logical_schedule=[],
             factory_timelines=[],
             violations=[],
+            feasibility_warnings=[],
         )
 
     code_family = _select_code_family(spec, candidate, metrics, dense_signals)
@@ -779,6 +881,8 @@ def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: Simula
     ancilla_total = achievable_logical * max(1, physical_per_logical - physical_per_logical * 2 // 3)
     total_required = spec.target_logical_qubits * physical_per_logical + factory_qubits_total
     logical_error = _logical_error_rate(library["alpha"], p_phys, library["threshold"], distance)
+    escalation_rule_triggered = logical_error > spec.target_logical_error_rate and distance == 3
+    escalated_distance_candidate = max(5 if escalation_rule_triggered else distance, required_distance)
     syndrome_cycle_ns = spec.syndrome_cycle_ns * library["syndrome_factor"] * (1.0 + 0.06 * max(distance - 3, 0))
     decoder_latency_ns = spec.decoder_margin_ns * library["decoder_factor"] * (1.0 + 0.06 * distance + 0.015 * candidate.qubits)
     logical_cycle_ns = syndrome_cycle_ns + decoder_latency_ns
@@ -824,6 +928,17 @@ def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: Simula
         violations.append("qec_latency")
     if magic_state_rate < max(0.5, 0.3 * spec.target_logical_qubits):
         violations.append("magic_state_rate")
+    if escalation_rule_triggered:
+        violations.append("distance_escalation")
+
+    actual_physical_per_target_logical, feasibility_warnings = _feasibility_warnings(
+        spec,
+        candidate,
+        code_family,
+        distance,
+        physical_per_logical,
+        total_required,
+    )
 
     return QECPlan(
         enabled=True,
@@ -856,6 +971,11 @@ def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: Simula
         average_patch_idle_ns=average_patch_idle_ns,
         factory_utilization=factory_utilization,
         decoder_utilization=decoder_utilization,
+        physical_qubits_per_target_logical=actual_physical_per_target_logical,
+        theoretical_physical_qubits_per_logical=physical_per_logical,
+        estimated_required_total_qubits=total_required,
+        escalation_rule_triggered=escalation_rule_triggered,
+        escalated_distance_candidate=escalated_distance_candidate,
         patches=patches,
         surgery_channels=surgery_channels,
         magic_state_factories=factories,
@@ -863,6 +983,7 @@ def build_qec_plan(spec: DesignSpec, candidate: CandidateDesign, metrics: Simula
         logical_schedule=logical_schedule,
         factory_timelines=factory_timelines,
         violations=violations,
+        feasibility_warnings=feasibility_warnings,
     )
 
 
