@@ -1,126 +1,307 @@
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
+import shutil
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-
-from .ollama_runtime import ensure_ollama_ready, prefer_local_preloaded_model, resolve_ollama_auth
-from .pipeline import run_pipeline
-from .requirements import _resolve_ollama_endpoint, parse_design_requirements
+from typing import Any
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="NV-center QSoC end-to-end EDA pipeline")
-    parser.add_argument("spec", nargs="?", help="Path to JSON spec")
-    parser.add_argument("--out", default="outputs/run", help="Output directory")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed")
-    parser.add_argument("--mc-trials", type=int, default=256, help="Monte Carlo trial count")
-    parser.add_argument("--generations", type=int, default=7, help="Search generations")
-    parser.add_argument("--beam-width", type=int, default=8, help="Beam width")
-    parser.add_argument("--mutations", type=int, default=7, help="Mutations per parent")
-    parser.add_argument("--quality", default="extreme", choices=["standard", "high", "extreme", "max"], help="Search/layout refinement quality mode")
-    parser.add_argument("--gui", action="store_true", help="Launch the GUI")
-    parser.add_argument("--requirements", help="Natural-language requirements string to parse into a spec")
-    parser.add_argument("--requirements-file", help="Path to a text/markdown file containing natural-language requirements")
-    parser.add_argument("--ollama-model", default="llama3.1:8b", help="Ollama model used for natural-language parsing")
-    parser.add_argument("--ollama-endpoint", default="", help="Ollama /api/generate endpoint URL (defaults to NVQSOC_OLLAMA_ENDPOINT or local Ollama)")
-    parser.add_argument("--ollama-auth-token", default="", help="Optional Ollama bearer token (or set NVQSOC_OLLAMA_AUTH_TOKEN)")
-    parser.add_argument("--ollama-auth-header", default="", help="Optional full Authorization header for Ollama (overrides --ollama-auth-token)")
-    parser.add_argument("--ollama-basic-auth", default="", help="Optional user:password for basic auth when the endpoint requires it")
-    parser.add_argument("--ollama-oauth-token-url", default="", help="OAuth token endpoint used to fetch an Ollama bearer token")
-    parser.add_argument("--ollama-oauth-client-id", default="", help="OAuth client ID for Ollama token acquisition")
-    parser.add_argument("--ollama-oauth-client-secret", default="", help="OAuth client secret for Ollama token acquisition")
-    parser.add_argument("--ollama-oauth-scope", default="", help="Optional OAuth scope for Ollama token acquisition")
-    parser.add_argument("--ollama-oauth-audience", default="", help="Optional OAuth audience for Ollama token acquisition")
-    parser.add_argument("--ollama-oauth-refresh-token", default="", help="Optional OAuth refresh token for Ollama token acquisition")
-    parser.add_argument("--skip-ollama-warmup", action="store_true", help="Skip startup Ollama model preload")
-    parser.add_argument("--team-profile", help="Optional JSON file describing team terminology aliases and template hints")
-    parser.add_argument("--team-notes", default="", help="Optional team-specific terminology or template notes appended to the natural-language parser")
-    parser.add_argument("--parse-only", action="store_true", help="Only parse natural-language requirements and print the decomposition JSON")
-    parser.add_argument("--crawl-papers", action="store_true", help="Use Scrapling to crawl NV-center paper pages and infer design priors")
-    parser.add_argument("--paper-limit", type=int, default=6, help="Maximum papers to crawl")
-    parser.add_argument("--advanced-top-k", type=int, default=3, help="Top frontier candidates for open-source simulation refinement")
-    return parser
+@dataclass(slots=True)
+class ArtifactRecord:
+    artifact_id: str
+    run_id: str
+    role: str
+    stage: str
+    path: str
+    file_name: str
+    extension: str
+    sha256: str
+    size_bytes: int
+    immutable_copy: str | None = None
+    producer: str = "nvqsoc_eda"
+    related_artifacts: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
-    requirements_text = None
-    if args.requirements_file:
-        requirements_text = Path(args.requirements_file).read_text(encoding="utf-8")
-    elif args.requirements:
-        requirements_text = args.requirements
+@dataclass(slots=True)
+class ArtifactRegistry:
+    run_id: str
+    output_dir: str
+    records: list[ArtifactRecord] = field(default_factory=list)
 
-    auth_context = resolve_ollama_auth(
-        args.ollama_auth_header or None,
-        args.ollama_auth_token or None,
-        args.ollama_basic_auth or None,
-        ollama_oauth_token_url=args.ollama_oauth_token_url or None,
-        ollama_oauth_client_id=args.ollama_oauth_client_id or None,
-        ollama_oauth_client_secret=args.ollama_oauth_client_secret or None,
-        ollama_oauth_scope=args.ollama_oauth_scope or None,
-        ollama_oauth_audience=args.ollama_oauth_audience or None,
-        ollama_oauth_refresh_token=args.ollama_oauth_refresh_token or None,
-    )
-    if not args.skip_ollama_warmup:
-        ensure_ollama_ready(
-            args.ollama_model,
-            _resolve_ollama_endpoint(args.ollama_endpoint or None),
-            timeout_s=60,
-            auth_header=auth_context.auth_header,
-            auth_mode=auth_context.mode,
-            auto_pull=not prefer_local_preloaded_model(auth_context.mode, _resolve_ollama_endpoint(args.ollama_endpoint or None)),
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "output_dir": self.output_dir,
+            "records": [record.to_dict() for record in self.records],
+        }
+
+
+@dataclass(slots=True)
+class HandoffBundle:
+    run_id: str
+    package_dir: str
+    package_manifest: str
+    immutable_artifacts: dict[str, str]
+    package_sha256: str
+    quarantined: bool = False
+    quarantine_flag: str = ""
+    quarantine_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _role_for_name(name: str) -> tuple[str, str]:
+    lowered = name.lower()
+    mapping = [
+        ("design_report.md", ("report", "reporting")),
+        ("layout.gds", ("gds", "layout_export")),
+        ("layout.oas", ("oas", "layout_export")),
+        ("layout.json", ("layout_json", "layout_export")),
+        ("layout.svg", ("layout_svg", "layout_export")),
+        ("layout_preview.png", ("layout_preview", "layout_export")),
+        ("layout_klayout.py", ("klayout_script", "layout_export")),
+        ("layer_map.json", ("layer_map", "layout_export")),
+        ("gds_hierarchy.json", ("gds_hierarchy", "layout_export")),
+        ("topology_plan.json", ("topology_plan", "topology")),
+        ("qec_plan.json", ("qec_plan", "qec")),
+        ("layout_consistency.json", ("layout_consistency", "signoff")),
+        ("layout_parasitics.json", ("layout_parasitics", "signoff")),
+        ("signoff_schema.json", ("signoff_schema", "signoff")),
+        ("signoff_manifest.json", ("signoff_manifest", "signoff")),
+        ("optimization.json", ("optimization", "optimization")),
+        ("normalized_spec.json", ("normalized_spec", "input")),
+        ("summary.json", ("summary", "signoff")),
+        ("requirements_analysis.json", ("requirements", "input")),
+        ("paper_knowledge.json", ("paper_knowledge", "research")),
+    ]
+    for key, result in mapping:
+        if lowered.endswith(key):
+            return result
+    if "advanced" in lowered:
+        return "advanced_sim", "advanced"
+    return "artifact", "misc"
+
+
+def build_artifact_registry(run_id: str, output_dir: Path, artifact_paths: dict[str, str]) -> ArtifactRegistry:
+    records: list[ArtifactRecord] = []
+    for alias, value in sorted(artifact_paths.items()):
+        if not value:
+            continue
+        path = Path(value)
+        if not path.exists() or path.is_dir():
+            continue
+        role, stage = _role_for_name(path.name)
+        record = ArtifactRecord(
+            artifact_id=alias,
+            run_id=run_id,
+            role=role,
+            stage=stage,
+            path=str(path),
+            file_name=path.name,
+            extension=path.suffix.lower(),
+            sha256=_sha256(path),
+            size_bytes=path.stat().st_size,
         )
+        records.append(record)
 
-    if args.gui or (not args.spec and requirements_text is None):
-        from .gui import main as gui_main
+    id_to_record = {record.artifact_id: record for record in records}
+    relations = {
+        "report": ["gds", "layout_json", "qec_plan", "topology_plan", "signoff_manifest"],
+        "gds": ["layout_json", "layer_map", "gds_hierarchy"],
+        "optimization": ["requirements_json", "paper_knowledge_json", "qec_plan"],
+    }
+    for alias, linked in relations.items():
+        record = id_to_record.get(alias)
+        if record is None:
+            continue
+        record.related_artifacts = [item for item in linked if item in id_to_record]
+    return ArtifactRegistry(run_id=run_id, output_dir=str(output_dir), records=records)
 
-        gui_main()
-        return
 
-    requirements_bundle = None
-    spec_path = Path(args.spec) if args.spec else None
-    spec_data = None
-    if requirements_text is not None:
-        requirements_bundle = parse_design_requirements(
-            requirements_text,
-            model=args.ollama_model,
-            team_profile_path=args.team_profile,
-            team_notes=args.team_notes,
-            ollama_endpoint=args.ollama_endpoint or None,
-            ollama_auth_header=args.ollama_auth_header or None,
-            ollama_auth_token=args.ollama_auth_token or None,
-            ollama_basic_auth=args.ollama_basic_auth or None,
-            ollama_oauth_token_url=args.ollama_oauth_token_url or None,
-            ollama_oauth_client_id=args.ollama_oauth_client_id or None,
-            ollama_oauth_client_secret=args.ollama_oauth_client_secret or None,
-            ollama_oauth_scope=args.ollama_oauth_scope or None,
-            ollama_oauth_audience=args.ollama_oauth_audience or None,
-            ollama_oauth_refresh_token=args.ollama_oauth_refresh_token or None,
-        )
-        if args.parse_only:
-            print(json.dumps(requirements_bundle.to_dict(), indent=2, ensure_ascii=False))
-            return
-        spec_data = requirements_bundle.normalized_spec
+def write_artifact_registry(output_dir: Path, registry: ArtifactRegistry) -> dict[str, str]:
+    path = output_dir / "artifact_registry.json"
+    path.write_text(json.dumps(registry.to_dict(), indent=2), encoding="utf-8")
+    return {"artifact_registry": str(path)}
 
-    summary = run_pipeline(
-        spec_path=spec_path,
-        spec_data=spec_data,
-        output_dir=Path(args.out),
-        seed=args.seed,
-        monte_carlo_trials=args.mc_trials,
-        generations=args.generations,
-        beam_width=args.beam_width,
-        mutations_per_parent=args.mutations,
-        crawl_papers=args.crawl_papers,
-        paper_limit=args.paper_limit,
-        advanced_top_k=args.advanced_top_k,
-        quality_mode=args.quality,
-        requirements_bundle=requirements_bundle,
+
+def create_handoff_bundle(
+    run_id: str,
+    output_dir: Path,
+    registry: ArtifactRegistry,
+    *,
+    quarantined: bool = False,
+    quarantine_reason: str = "",
+) -> HandoffBundle:
+    package_dir = output_dir / ("QUARANTINE" if quarantined else "handoff")
+    package_dir.mkdir(parents=True, exist_ok=True)
+    immutable_artifacts: dict[str, str] = {}
+    selected_roles = {"report", "gds", "oas", "layout_json", "qec_plan", "topology_plan", "signoff_manifest", "artifact_registry"}
+    for record in registry.records:
+        if record.role not in selected_roles:
+            continue
+        source = Path(record.path)
+        blocked_suffix = "__BLOCKED" if quarantined else ""
+        immutable_name = f"{run_id}__{source.stem}{blocked_suffix}{source.suffix}"
+        destination = package_dir / immutable_name
+        shutil.copy2(source, destination)
+        immutable_artifacts[record.artifact_id] = str(destination)
+        record.immutable_copy = str(destination)
+
+    manifest_suffix = "__BLOCKED" if quarantined else ""
+    package_manifest_path = package_dir / f"{run_id}__handoff_manifest{manifest_suffix}.json"
+    package_payload = {
+        "run_id": run_id,
+        "quarantined": quarantined,
+        "quarantine_flag": "QUARANTINE" if quarantined else "",
+        "quarantine_reason": quarantine_reason,
+        "blocked_suffix": "BLOCKED" if quarantined else "",
+        "immutable_artifacts": immutable_artifacts,
+        "registry": registry.to_dict(),
+    }
+    package_manifest_path.write_text(json.dumps(package_payload, indent=2), encoding="utf-8")
+    package_sha = _sha256(package_manifest_path)
+    return HandoffBundle(
+        run_id=run_id,
+        package_dir=str(package_dir),
+        package_manifest=str(package_manifest_path),
+        immutable_artifacts=immutable_artifacts,
+        package_sha256=package_sha,
+        quarantined=quarantined,
+        quarantine_flag="QUARANTINE" if quarantined else "",
+        quarantine_reason=quarantine_reason,
     )
-    print(json.dumps(summary, indent=2))
 
 
-if __name__ == "__main__":
-    main()
+def write_handoff_bundle(output_dir: Path, bundle: HandoffBundle) -> dict[str, str]:
+    path = output_dir / "handoff_bundle.json"
+    path.write_text(json.dumps(bundle.to_dict(), indent=2), encoding="utf-8")
+    return {"handoff_bundle": str(path)}
+
+
+# ---------------------------------------------------------------------------
+# Bundle Integrity & Completeness Verification
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class BundleAuditResult:
+    """Result of integrity and completeness verification of a handoff bundle."""
+    integrity_pass: bool
+    completeness_pass: bool
+    overall_pass: bool
+    timestamp: str
+    sha_mismatches: list[dict[str, str]] = field(default_factory=list)
+    missing_artifacts: list[str] = field(default_factory=list)
+    present_artifacts: list[str] = field(default_factory=list)
+    file_not_found: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def verify_bundle_integrity(bundle: HandoffBundle, registry: ArtifactRegistry) -> BundleAuditResult:
+    """Re-compute SHA256 for all immutable artifacts and verify against registry."""
+    from datetime import datetime, timezone
+
+    sha_mismatches: list[dict[str, str]] = []
+    file_not_found: list[str] = []
+
+    # Build lookup from registry
+    registry_sha: dict[str, str] = {}
+    for record in registry.records:
+        if record.immutable_copy:
+            registry_sha[record.immutable_copy] = record.sha256
+        registry_sha[record.path] = record.sha256
+
+    for alias, immutable_path_str in bundle.immutable_artifacts.items():
+        immutable_path = Path(immutable_path_str)
+        if not immutable_path.exists():
+            file_not_found.append(alias)
+            continue
+        actual_sha = _sha256(immutable_path)
+        expected_sha = registry_sha.get(immutable_path_str)
+        if expected_sha is not None and actual_sha != expected_sha:
+            sha_mismatches.append({
+                "artifact_id": alias,
+                "path": immutable_path_str,
+                "expected_sha256": expected_sha,
+                "actual_sha256": actual_sha,
+            })
+
+    integrity_pass = len(sha_mismatches) == 0 and len(file_not_found) == 0
+
+    return BundleAuditResult(
+        integrity_pass=integrity_pass,
+        completeness_pass=True,  # Will be filled by check_bundle_completeness
+        overall_pass=integrity_pass,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        sha_mismatches=sha_mismatches,
+        file_not_found=file_not_found,
+    )
+
+
+def check_bundle_completeness(bundle: HandoffBundle, registry: ArtifactRegistry) -> BundleAuditResult:
+    """Verify that all required roles are present in the handoff bundle."""
+    from datetime import datetime, timezone
+
+    required_roles = {"report", "gds", "layout_json", "signoff_manifest"}
+    optional_roles = {"oas", "qec_plan", "topology_plan", "artifact_registry"}
+
+    present_roles: set[str] = set()
+    for record in registry.records:
+        if record.role in required_roles or record.role in optional_roles:
+            # Check if this artifact is in the immutable bundle
+            if record.artifact_id in bundle.immutable_artifacts:
+                present_roles.add(record.role)
+
+    missing = [role for role in sorted(required_roles) if role not in present_roles]
+    present = sorted(present_roles)
+    completeness_pass = len(missing) == 0
+
+    return BundleAuditResult(
+        integrity_pass=True,  # Not checked here
+        completeness_pass=completeness_pass,
+        overall_pass=completeness_pass,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        missing_artifacts=missing,
+        present_artifacts=present,
+    )
+
+
+def audit_handoff_bundle(bundle: HandoffBundle, registry: ArtifactRegistry) -> BundleAuditResult:
+    """Full audit: integrity + completeness combined."""
+    integrity = verify_bundle_integrity(bundle, registry)
+    completeness = check_bundle_completeness(bundle, registry)
+
+    overall = integrity.integrity_pass and completeness.completeness_pass
+
+    return BundleAuditResult(
+        integrity_pass=integrity.integrity_pass,
+        completeness_pass=completeness.completeness_pass,
+        overall_pass=overall,
+        timestamp=integrity.timestamp,
+        sha_mismatches=integrity.sha_mismatches,
+        missing_artifacts=completeness.missing_artifacts,
+        present_artifacts=completeness.present_artifacts,
+        file_not_found=integrity.file_not_found,
+    )
+
+
+def write_bundle_audit(output_dir: Path, audit: BundleAuditResult) -> dict[str, str]:
+    """Write the bundle audit result to disk."""
+    path = output_dir / "bundle_audit.json"
+    path.write_text(json.dumps(audit.to_dict(), indent=2), encoding="utf-8")
+    return {"bundle_audit": str(path)}
