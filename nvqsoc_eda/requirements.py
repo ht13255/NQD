@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import urllib.error
 import urllib.request
@@ -8,10 +10,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .ollama_runtime import ensure_ollama_ready, prefer_local_preloaded_model, resolve_ollama_auth
 from .spec import DesignSpec
 
 
-OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
+DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
+OLLAMA_ENDPOINT = DEFAULT_OLLAMA_ENDPOINT
 
 
 @dataclass(slots=True)
@@ -44,6 +48,13 @@ class RequirementBundle:
     team_profile_name: str = "default_nv_team"
     team_notes: str = ""
     parse_confidence: float = 0.5
+    ollama_endpoint: str = DEFAULT_OLLAMA_ENDPOINT
+    ollama_runtime_ready: bool = False
+    ollama_started_local_service: bool = False
+    ollama_model_available: bool = False
+    ollama_model_pulled: bool = False
+    ollama_model_loaded: bool = False
+    ollama_auth_mode: str = "none"
     layers: RequirementLayers = field(default_factory=RequirementLayers)
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,7 +80,7 @@ DEFAULT_TEAM_PROFILE = TeamProfile(
     application_aliases={
         "quantum_repeater": ["repeater", "network", "entanglement", "node", "link", "spin-photon", "리피터", "네트워크 노드", "링크"],
         "magnetometer": ["magnetometer", "magnetometry", "sensor", "odmr", "자기 센서", "field imaging"],
-        "processor": ["processor", "logic", "compute", "연산", "제어 중심"],
+        "processor": ["processor", "logic", "compute", "qsoc", "q soc", "accelerator", "parallel control", "throughput", "gpu", "gpu-style", "연산", "제어 중심", "가속기", "병렬 제어"],
         "memory": ["memory", "buffer", "storage", "quantum memory", "메모리"],
         "imager": ["imager", "imaging", "microscope", "이미징", "camera"],
     },
@@ -97,6 +108,7 @@ DEFAULT_TEAM_PROFILE = TeamProfile(
     default_layout_focus=[
         "Pad ring, seal ring, shielding fence, power mesh, and segmented macros",
         "Tile-level keepout, via farms, resonator spines, and redundant optical trunks",
+        "Integrated laser source banks, driver islands, and optical feed tap structures",
     ],
     default_simulation_focus=[
         "Spin-photon-control analytical stack",
@@ -115,6 +127,11 @@ def _load_team_profile(team_profile_path: str | Path | None) -> TeamProfile:
     data = json.loads(Path(team_profile_path).read_text(encoding="utf-8"))
     merged = DEFAULT_TEAM_PROFILE.to_dict() | data
     return TeamProfile(**merged)
+
+
+def _resolve_ollama_endpoint(ollama_endpoint: str | None) -> str:
+    value = (ollama_endpoint or os.getenv("NVQSOC_OLLAMA_ENDPOINT") or os.getenv("OLLAMA_ENDPOINT") or OLLAMA_ENDPOINT).strip()
+    return value or OLLAMA_ENDPOINT
 
 
 def _application_from_text(text: str, team_profile: TeamProfile) -> str:
@@ -232,6 +249,113 @@ def _extract_qec_code(text: str) -> str | None:
     return None
 
 
+def _contains_any(text: str, tokens: list[str]) -> bool:
+    lowered = text.lower()
+    return any(token.lower() in lowered for token in tokens)
+
+
+def _fault_tolerant_intent(text: str) -> bool:
+    return _contains_any(
+        text,
+        [
+            "fault tolerant",
+            "fault-tolerant",
+            "fault tolerance",
+            "ftqc",
+            "logical qubit",
+            "logical-qubit",
+            "error correction",
+            "surface code",
+            "color code",
+            "bacon shor",
+            "syndrome",
+            "decoder",
+            "내결함",
+            "결함 허용",
+            "내성 결함",
+            "논리 큐비트",
+        ],
+    )
+
+
+def _gpu_accelerator_intent(text: str) -> bool:
+    return _contains_any(
+        text,
+        [
+            "gpu",
+            "accelerator",
+            "parallel control",
+            "parallel readout",
+            "throughput",
+            "high-performance",
+            "high performance",
+            "very powerful chip",
+            "강력한 칩",
+            "가속기",
+            "병렬 제어",
+            "고성능",
+        ],
+    )
+
+
+def _boost_objective_weights(base_weights: dict[str, float], boosts: dict[str, float]) -> dict[str, float]:
+    merged = {key: max(float(value), 0.0) for key, value in base_weights.items()}
+    for key, value in boosts.items():
+        merged[key] = merged.get(key, 0.0) + max(float(value), 0.0)
+    total = sum(merged.values()) or 1.0
+    return {key: value / total for key, value in merged.items()}
+
+
+def _enrich_spec_for_design_intent(
+    requirements_text: str,
+    spec_dict: dict[str, Any],
+    *,
+    team_notes: str = "",
+) -> dict[str, Any]:
+    enriched = dict(spec_dict)
+    intent_text = (requirements_text + "\n" + team_notes).strip()
+    fault_tolerant = _fault_tolerant_intent(intent_text)
+    gpu_accelerated = _gpu_accelerator_intent(intent_text)
+    target_qubits = int(enriched.get("target_qubits", 64))
+    logical_qubits = int(enriched.get("target_logical_qubits", max(1, target_qubits // 48)))
+
+    if gpu_accelerated and str(enriched.get("application", "general")).lower() == "general":
+        enriched["application"] = "processor"
+
+    if fault_tolerant:
+        logical_floor = max(2, int(math.ceil(target_qubits / (32.0 if gpu_accelerated else 64.0))))
+        enriched["target_logical_qubits"] = max(logical_qubits, logical_floor)
+        enriched["qec_enabled"] = True
+        if str(enriched.get("qec_code", "auto")).lower() in {"", "auto", "none"}:
+            enriched["qec_code"] = "surface_code"
+        enriched["target_gate_fidelity"] = max(float(enriched.get("target_gate_fidelity", 0.995)), 0.996)
+        enriched["target_readout_fidelity"] = max(float(enriched.get("target_readout_fidelity", 0.965)), 0.975)
+        enriched["target_t2_us"] = max(float(enriched.get("target_t2_us", 1200.0)), 1400.0 if gpu_accelerated else 1250.0)
+        enriched["min_yield"] = max(float(enriched.get("min_yield", 0.72)), 0.74)
+
+    if gpu_accelerated:
+        if str(enriched.get("routing_preference", "balanced")).lower() == "balanced":
+            enriched["routing_preference"] = "low_loss"
+        enriched["max_power_mw"] = max(float(enriched.get("max_power_mw", 480.0)), 620.0)
+        enriched["optical_power_budget_mw"] = max(float(enriched.get("optical_power_budget_mw", 140.0)), 190.0)
+        enriched["max_latency_ns"] = min(float(enriched.get("max_latency_ns", 180.0)), 180.0)
+
+    base_weights = {key: float(value) for key, value in dict(enriched.get("objective_weights", {})).items()}
+    if fault_tolerant:
+        base_weights = _boost_objective_weights(
+            base_weights,
+            {"logical": 0.10, "qec": 0.10, "schedule": 0.06, "crosstalk": 0.04, "robustness": 0.03},
+        )
+    if gpu_accelerated:
+        base_weights = _boost_objective_weights(
+            base_weights,
+            {"scalability": 0.08, "latency": 0.05, "schedule": 0.04, "world_model": 0.03, "placement": 0.02},
+        )
+    if base_weights:
+        enriched["objective_weights"] = base_weights
+    return enriched
+
+
 def _infer_weights(text: str, team_profile: TeamProfile) -> dict[str, float]:
     lowered = text.lower()
     weights = {
@@ -275,7 +399,7 @@ def _extract_requirement_layers(requirements_text: str, normalized_spec: dict[st
             physical_context.append(clause)
         if any(token in clause_low for token in ["logical", "qec", "error correction", "syndrome", "decoder", "fault tolerant"]):
             logical_context.append(clause)
-        if any(token in clause_low for token in ["layout", "pad ring", "shield", "routing", "bus", "tile", "macro", "area", "dense"]):
+        if any(token in clause_low for token in ["layout", "pad ring", "shield", "routing", "bus", "tile", "macro", "area", "dense", "laser", "photonic"]):
             layout_directives.append(clause)
         if any(token in clause_low for token in ["simulate", "simulation", "cross-talk", "entanglement", "noise", "thermal", "latency"]):
             simulation_directives.append(clause)
@@ -305,25 +429,35 @@ def _extract_requirement_layers(requirements_text: str, normalized_spec: dict[st
 
 def _heuristic_requirements(requirements_text: str, team_profile: TeamProfile, team_notes: str) -> RequirementBundle:
     application = _application_from_text(requirements_text, team_profile)
-    qubits = float(_extract_target_qubits(requirements_text) or 64)
-    derived_area = max(24.0, 20.0 + 0.14 * qubits + 6.0 * max(1, int(_extract_logical_qubits(requirements_text) or max(1, int(qubits) // 48))))
+    fault_tolerant = _fault_tolerant_intent(requirements_text + "\n" + team_notes)
+    gpu_accelerated = _gpu_accelerator_intent(requirements_text + "\n" + team_notes)
+    extracted_qubits = _extract_target_qubits(requirements_text)
+    default_qubits = 256 if fault_tolerant and gpu_accelerated else 192 if gpu_accelerated else 96 if fault_tolerant else 64
+    qubits = float(extracted_qubits or default_qubits)
+    extracted_logical_qubits = _extract_logical_qubits(requirements_text)
+    logical_default = max(1, int(qubits) // 48)
+    if fault_tolerant:
+        logical_default = max(logical_default, int(math.ceil(qubits / (32.0 if gpu_accelerated else 64.0))))
+    derived_area = max(24.0, 20.0 + 0.14 * qubits + 6.0 * max(1, int(extracted_logical_qubits or logical_default)))
+    if gpu_accelerated:
+        derived_area = max(derived_area, 32.0 + 0.16 * qubits + 7.0 * max(1, int(extracted_logical_qubits or logical_default)))
     die_area = _extract_number([r"([0-9]+(?:\.[0-9]+)?)\s*mm(?:\^?2|²)", r"area[^\n0-9]*([0-9]+(?:\.[0-9]+)?)"], requirements_text) or derived_area
     power_value = _extract_number([r"([0-9]+(?:\.[0-9]+)?)\s*mw\b", r"power[^\n0-9]*([0-9]+(?:\.[0-9]+)?)"], requirements_text)
     temp_value = _extract_temperature_k(requirements_text) or 4.2
     field_value = _extract_magnetic_field_mT(requirements_text) or 18.0
-    t2_value = _extract_t2_us(requirements_text) or 1200.0
+    t2_value = _extract_t2_us(requirements_text) or (1400.0 if fault_tolerant and gpu_accelerated else 1250.0 if fault_tolerant else 1200.0)
     node_value = _extract_fabrication_node(requirements_text) or 90
     purity_value = _extract_isotopic_purity(requirements_text) or 30.0
     wavelength_value = _extract_wavelength_nm(requirements_text) or 637.0
     stage_count = _extract_cryo_stage_count(requirements_text) or (3 if temp_value <= 20.0 else 1)
-    logical_qubits = _extract_logical_qubits(requirements_text) or max(1, int(qubits) // 48)
+    logical_qubits = extracted_logical_qubits or logical_default
     logical_error_rate = _extract_logical_error_rate(requirements_text) or 1e-3
-    qec_code = _extract_qec_code(requirements_text) or "auto"
-    gate_fidelity = _extract_percent_value(requirements_text, ["gate", "게이트"]) or 0.995
-    readout_fidelity = _extract_percent_value(requirements_text, ["readout", "판독", "측정"]) or 0.965
-    latency_value = _extract_number([r"([0-9]+(?:\.[0-9]+)?)\s*ns\b", r"latency[^\n0-9]*([0-9]+(?:\.[0-9]+)?)"], requirements_text) or 180.0
-    yield_value = _extract_percent_value(requirements_text, ["yield", "수율"]) or 0.72
-    optical_budget = _extract_number([r"optical[^\n0-9]*([0-9]+(?:\.[0-9]+)?)\s*mw", r"laser[^\n0-9]*([0-9]+(?:\.[0-9]+)?)\s*mw"], requirements_text) or 140.0
+    qec_code = _extract_qec_code(requirements_text) or ("surface_code" if fault_tolerant else "auto")
+    gate_fidelity = _extract_percent_value(requirements_text, ["gate", "게이트"]) or (0.996 if fault_tolerant else 0.995)
+    readout_fidelity = _extract_percent_value(requirements_text, ["readout", "판독", "측정"]) or (0.975 if fault_tolerant else 0.965)
+    latency_value = _extract_number([r"([0-9]+(?:\.[0-9]+)?)\s*ns\b", r"latency[^\n0-9]*([0-9]+(?:\.[0-9]+)?)"], requirements_text) or (160.0 if gpu_accelerated else 180.0)
+    yield_value = _extract_percent_value(requirements_text, ["yield", "수율"]) or (0.74 if fault_tolerant else 0.72)
+    optical_budget = _extract_number([r"optical[^\n0-9]*([0-9]+(?:\.[0-9]+)?)\s*mw", r"laser[^\n0-9]*([0-9]+(?:\.[0-9]+)?)\s*mw"], requirements_text) or (190.0 if gpu_accelerated else 140.0)
 
     routing_preference = "balanced"
     lowered = requirements_text.lower()
@@ -331,6 +465,8 @@ def _heuristic_requirements(requirements_text: str, team_profile: TeamProfile, t
         if any(token.lower() in lowered for token in aliases):
             routing_preference = routing_key
             break
+    if routing_preference == "balanced" and gpu_accelerated:
+        routing_preference = "low_loss"
 
     design_name = re.sub(r"[^a-z0-9_]+", "_", f"{application}_{int(qubits)}q_from_nl".lower()).strip("_")
     spec_dict = {
@@ -339,7 +475,7 @@ def _heuristic_requirements(requirements_text: str, team_profile: TeamProfile, t
         "target_qubits": int(qubits),
         "target_logical_qubits": int(logical_qubits),
         "max_die_area_mm2": float(die_area),
-        "max_power_mw": float(power_value or 480.0),
+        "max_power_mw": float(power_value or (620.0 if gpu_accelerated else 480.0)),
         "operating_temp_k": float(temp_value),
         "magnetic_field_mT": float(field_value),
         "optical_wavelength_nm": float(wavelength_value),
@@ -362,6 +498,7 @@ def _heuristic_requirements(requirements_text: str, team_profile: TeamProfile, t
         "routing_preference": routing_preference,
         "objective_weights": _infer_weights(requirements_text + "\n" + team_notes, team_profile),
     }
+    spec_dict = _enrich_spec_for_design_intent(requirements_text, spec_dict, team_notes=team_notes)
     normalized = DesignSpec.from_dict(spec_dict).to_dict()
     goals = [
         f"Target {normalized['target_qubits']} qubits for {normalized['application']}",
@@ -369,6 +506,10 @@ def _heuristic_requirements(requirements_text: str, team_profile: TeamProfile, t
         f"Hit gate fidelity >= {normalized['target_gate_fidelity']:.4f}",
         f"Hit readout fidelity >= {normalized['target_readout_fidelity']:.4f}",
     ]
+    if gpu_accelerated:
+        goals.append("Sustain accelerator-style parallel control/readout throughput without collapsing routing or cryogenic margins")
+    if fault_tolerant:
+        goals.append("Preserve a fault-tolerant operating point with explicit logical-qubit and decoder budget")
     constraints = [
         f"Die area <= {normalized['max_die_area_mm2']} mm2",
         f"Power <= {normalized['max_power_mw']} mW",
@@ -379,14 +520,26 @@ def _heuristic_requirements(requirements_text: str, team_profile: TeamProfile, t
         f"Primary application maps to `{normalized['application']}` architecture priors",
         f"Routing preference inferred as `{normalized['routing_preference']}`",
     ]
+    if gpu_accelerated:
+        architecture_hypotheses.append("Accelerator intent favors a processor-style macro fabric with wider control/readout trunks")
+    if fault_tolerant:
+        architecture_hypotheses.append("Fault-tolerant intent favors decoder-locality-aware logical patching with stronger shielding and routing margin")
     simulation_focus = list(team_profile.default_simulation_focus)
     simulation_focus.append("QEC threshold, logical error-rate, and syndrome/decoder timing analysis")
+    if gpu_accelerated:
+        simulation_focus.append("Parallel control/readout throughput, cryogenic amplifier headroom, and routing hotspot analysis")
     layout_focus = list(team_profile.default_layout_focus)
     layout_focus.append("Logical patch overlays, syndrome lanes, and ancilla-rich stabilizer structure")
+    if gpu_accelerated:
+        layout_focus.append("Wide optical trunks, parallel microwave domains, and GPU-style control aggregation islands")
     assumptions = [
         "Unspecified quantities use repository defaults",
         "Natural language ambiguities are resolved toward safe balanced cryogenic operation",
     ]
+    if gpu_accelerated:
+        assumptions.append("Accelerator/GPU wording was mapped to a high-throughput NV-center processor fabric intent")
+    if fault_tolerant:
+        assumptions.append("Fault-tolerant wording forced an explicit logical-qubit and surface-code-ready planning bias")
     if team_notes.strip():
         assumptions.append(f"Team notes applied: {team_notes.strip()}")
     layers = _extract_requirement_layers(requirements_text, normalized)
@@ -479,13 +632,22 @@ Infer not only numeric limits but also design intent, likely architecture, simul
 Prefer conservative physically realistic assumptions over optimistic ones.
 If the user mixes multiple intents, choose the primary application and mention secondary intents in assumptions.
 Infer logical-qubit intent and QEC code whenever the text mentions logical qubits, error correction, syndrome, decoder, or fault tolerance.
+Map GPU/accelerator/high-throughput language to processor-style parallel control/readout fabrics when appropriate.
 
 User requirements:
 {requirements_text}
 """.strip()
 
 
-def _ollama_parse(requirements_text: str, model: str, timeout_s: int, team_profile: TeamProfile, team_notes: str) -> RequirementBundle | None:
+def _ollama_parse(
+    requirements_text: str,
+    model: str,
+    timeout_s: int,
+    team_profile: TeamProfile,
+    team_notes: str,
+    ollama_endpoint: str,
+    ollama_auth_header: str | None,
+) -> RequirementBundle | None:
     payload = json.dumps(
         {
             "model": model,
@@ -495,7 +657,10 @@ def _ollama_parse(requirements_text: str, model: str, timeout_s: int, team_profi
             "options": {"temperature": 0.1},
         }
     ).encode("utf-8")
-    request = urllib.request.Request(OLLAMA_ENDPOINT, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    if ollama_auth_header:
+        headers["Authorization"] = ollama_auth_header
+    request = urllib.request.Request(ollama_endpoint, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             result = json.loads(response.read().decode("utf-8", "ignore"))
@@ -506,7 +671,12 @@ def _ollama_parse(requirements_text: str, model: str, timeout_s: int, team_profi
         return None
     try:
         parsed = json.loads(raw_json)
-        normalized_spec = DesignSpec.from_dict(parsed.get("normalized_spec", {})).to_dict()
+        normalized_spec = _enrich_spec_for_design_intent(
+            requirements_text,
+            DesignSpec.from_dict(parsed.get("normalized_spec", {})).to_dict(),
+            team_notes=team_notes,
+        )
+        normalized_spec = DesignSpec.from_dict(normalized_spec).to_dict()
     except Exception:
         return None
     return RequirementBundle(
@@ -524,6 +694,9 @@ def _ollama_parse(requirements_text: str, model: str, timeout_s: int, team_profi
         team_profile_name=team_profile.name,
         team_notes=team_notes,
         parse_confidence=0.84,
+        ollama_endpoint=ollama_endpoint,
+        ollama_runtime_ready=True,
+        ollama_model_available=True,
         layers=_extract_requirement_layers(requirements_text, normalized_spec),
     )
 
@@ -534,15 +707,61 @@ def parse_design_requirements(
     timeout_s: int = 120,
     team_profile_path: str | Path | None = None,
     team_notes: str = "",
+    ollama_endpoint: str | None = None,
+    ollama_auth_header: str | None = None,
+    ollama_auth_token: str | None = None,
+    ollama_basic_auth: str | None = None,
+    ollama_oauth_token_url: str | None = None,
+    ollama_oauth_client_id: str | None = None,
+    ollama_oauth_client_secret: str | None = None,
+    ollama_oauth_scope: str | None = None,
+    ollama_oauth_audience: str | None = None,
+    ollama_oauth_refresh_token: str | None = None,
 ) -> RequirementBundle:
     requirements_text = requirements_text.strip()
     if not requirements_text:
         raise ValueError("requirements_text must not be empty")
     team_profile = _load_team_profile(team_profile_path)
-    bundle = _ollama_parse(requirements_text, model=model, timeout_s=timeout_s, team_profile=team_profile, team_notes=team_notes)
-    if bundle is not None:
-        return bundle
-    return _heuristic_requirements(requirements_text, team_profile=team_profile, team_notes=team_notes)
+    endpoint = _resolve_ollama_endpoint(ollama_endpoint)
+    auth_context = resolve_ollama_auth(
+        ollama_auth_header,
+        ollama_auth_token,
+        ollama_basic_auth,
+        ollama_oauth_token_url=ollama_oauth_token_url,
+        ollama_oauth_client_id=ollama_oauth_client_id,
+        ollama_oauth_client_secret=ollama_oauth_client_secret,
+        ollama_oauth_scope=ollama_oauth_scope,
+        ollama_oauth_audience=ollama_oauth_audience,
+        ollama_oauth_refresh_token=ollama_oauth_refresh_token,
+        timeout_s=min(timeout_s, 30),
+    )
+    runtime_status = ensure_ollama_ready(
+        model,
+        endpoint,
+        timeout_s=min(timeout_s, 60),
+        auth_header=auth_context.auth_header,
+        auth_mode=auth_context.mode,
+        auto_pull=not prefer_local_preloaded_model(auth_context.mode, endpoint),
+    )
+    bundle = _ollama_parse(
+        requirements_text,
+        model=model,
+        timeout_s=timeout_s,
+        team_profile=team_profile,
+        team_notes=team_notes,
+        ollama_endpoint=endpoint,
+        ollama_auth_header=auth_context.auth_header,
+    )
+    if bundle is None:
+        bundle = _heuristic_requirements(requirements_text, team_profile=team_profile, team_notes=team_notes)
+    bundle.ollama_endpoint = endpoint
+    bundle.ollama_auth_mode = auth_context.mode
+    bundle.ollama_runtime_ready = runtime_status.available
+    bundle.ollama_started_local_service = runtime_status.started_local_service
+    bundle.ollama_model_available = runtime_status.model_available
+    bundle.ollama_model_pulled = runtime_status.model_pulled
+    bundle.ollama_model_loaded = runtime_status.model_loaded
+    return bundle
 
 
 def write_requirement_artifacts(output_dir: Path, bundle: RequirementBundle, include_markdown: bool = False) -> dict[str, str]:
@@ -557,6 +776,9 @@ def write_requirement_artifacts(output_dir: Path, bundle: RequirementBundle, inc
         f"- Source: `{bundle.source}`",
         f"- Model: `{bundle.model}`",
         f"- Ollama used: `{bundle.ollama_used}`",
+        f"- Ollama endpoint: `{bundle.ollama_endpoint}`",
+        f"- Ollama runtime/model ready: `{bundle.ollama_runtime_ready}` / `{bundle.ollama_model_available}`",
+        f"- Ollama model loaded / auth mode: `{bundle.ollama_model_loaded}` / `{bundle.ollama_auth_mode}`",
         f"- Team profile: `{bundle.team_profile_name}`",
         "",
         "## Goals",
