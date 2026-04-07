@@ -90,6 +90,7 @@ class PaperRecord:
 class PaperKnowledge:
     application: str
     queries: list[str]
+    query_terms: list[str]
     discovered_urls: list[str]
     papers: list[PaperRecord]
     topic_counts: dict[str, int]
@@ -102,11 +103,13 @@ class PaperKnowledge:
     recommended_optical_bus_ratio: float
     architecture_priors: dict[str, float]
     semantic_focus_terms: list[str]
+    recommendation_provenance: dict[str, list[dict[str, Any]]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "application": self.application,
             "queries": self.queries,
+            "query_terms": self.query_terms,
             "discovered_urls": self.discovered_urls,
             "papers": [paper.to_dict() for paper in self.papers],
             "topic_counts": self.topic_counts,
@@ -119,6 +122,7 @@ class PaperKnowledge:
             "recommended_optical_bus_ratio": self.recommended_optical_bus_ratio,
             "architecture_priors": self.architecture_priors,
             "semantic_focus_terms": self.semantic_focus_terms,
+            "recommendation_provenance": self.recommendation_provenance,
         }
 
 
@@ -304,16 +308,14 @@ def _weighted_median(values: list[float], weights: list[float], fallback: float)
 
 
 def _relevance_weights(spec: DesignSpec, papers: list[PaperRecord]) -> tuple[list[float], list[str]]:
+    physicalized_terms = _physicalized_numeric_terms(spec)
     query_text = " ".join(
         [
             spec.design_name,
             spec.application,
-            f"target qubits {spec.target_qubits}",
-            f"gate fidelity {spec.target_gate_fidelity}",
-            f"readout fidelity {spec.target_readout_fidelity}",
-            f"T2 {spec.target_t2_us}",
-            f"magnetic field {spec.magnetic_field_mT}",
-            f"temperature {spec.operating_temp_k}",
+            *physicalized_terms,
+            "nv center spin qubit array",
+            "photonic microwave cryogenic layout",
             spec.routing_preference,
         ]
     )
@@ -369,8 +371,84 @@ def _infer_architecture_priors(spec: DesignSpec, weighted_topics: dict[str, floa
     return base
 
 
+def _physicalized_numeric_terms(spec: DesignSpec) -> list[str]:
+    terms = ["NV-center spin qubit array", "diamond photonic control fabric"]
+    if spec.target_qubits >= 48:
+        terms.append("scalable multi-qubit array")
+    if spec.target_qubits >= 96:
+        terms.append("large-scale qubit array")
+    if spec.target_logical_qubits >= 1:
+        terms.append("fault-tolerant logical patch")
+    if spec.target_logical_qubits >= 4:
+        terms.append("multi-logical-qubit surface code fabric")
+    if spec.max_latency_ns <= 220.0:
+        terms.append("low-latency cryogenic control network")
+    if spec.operating_temp_k <= 10.0:
+        terms.append("cryogenic photonic interface")
+    if spec.routing_preference == "low_loss":
+        terms.append("low-loss resonator waveguide network")
+    return list(dict.fromkeys(terms))
+
+
+def _spec_query_terms(spec: DesignSpec) -> list[str]:
+    terms = ["NV center diamond", "NV-center spin qubit array", *_physicalized_numeric_terms(spec)]
+    if spec.application == "processor":
+        terms.extend(["fault tolerant logical qubit", "cryogenic control fabric", "parallel readout"]) 
+    if spec.target_logical_qubits > 1:
+        terms.append("logical qubit decoder locality")
+    if spec.target_t2_us >= 1000.0:
+        terms.append("long spin coherence")
+    return list(dict.fromkeys(terms))
+
+
+def _build_application_queries(spec: DesignSpec) -> tuple[list[str], list[str]]:
+    base_queries = list(APPLICATION_QUERY_MAP.get(spec.application.lower(), APPLICATION_QUERY_MAP["general"]))
+    query_terms = _spec_query_terms(spec)
+    extra_queries = [f'all:"NV center" AND all:diamond AND all:"{term}"' for term in query_terms[:4]]
+    return list(dict.fromkeys(base_queries + extra_queries)), query_terms
+
+
+def _recommendation_provenance(papers: list[PaperRecord], key: str, recommended_value: float) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for paper in papers:
+        for value in paper.extracted_values.get(key, []):
+            rows.append(
+                {
+                    "paper": paper.title or paper.url,
+                    "url": paper.url,
+                    "value": value,
+                    "recommended_value": recommended_value,
+                    "relevance_score": paper.relevance_score,
+                    "distance": abs(value - recommended_value),
+                }
+            )
+    rows.sort(key=lambda item: (item["distance"], -item["relevance_score"]))
+    return rows[:4]
+
+
+def _topic_recommendation_provenance(papers: list[PaperRecord], recommended_value: float, topic_keys: set[str], label: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for paper in papers:
+        matched_topics = sorted(topic_keys & set(paper.keywords))
+        if not matched_topics:
+            continue
+        rows.append(
+            {
+                "paper": paper.title or paper.url,
+                "url": paper.url,
+                "value": label,
+                "recommended_value": recommended_value,
+                "relevance_score": paper.relevance_score,
+                "matched_topics": matched_topics,
+                "distance": 0.0,
+            }
+        )
+    rows.sort(key=lambda item: -item["relevance_score"])
+    return rows[:4]
+
+
 def build_paper_knowledge(spec: DesignSpec, max_papers: int = 6) -> PaperKnowledge:
-    queries = APPLICATION_QUERY_MAP.get(spec.application.lower(), APPLICATION_QUERY_MAP["general"])
+    queries, query_terms = _build_application_queries(spec)
     discovered: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     per_query = max(2, max_papers // max(len(queries), 1) + 1)
@@ -486,6 +564,7 @@ def build_paper_knowledge(spec: DesignSpec, max_papers: int = 6) -> PaperKnowled
     return PaperKnowledge(
         application=spec.application,
         queries=queries,
+        query_terms=query_terms,
         discovered_urls=[entry["url"] for entry in discovered],
         papers=papers,
         topic_counts=topic_counts,
@@ -498,6 +577,15 @@ def build_paper_knowledge(spec: DesignSpec, max_papers: int = 6) -> PaperKnowled
         recommended_optical_bus_ratio=recommended_bus_ratio,
         architecture_priors=_infer_architecture_priors(spec, weighted_topics),
         semantic_focus_terms=focus_terms,
+        recommendation_provenance={
+            "cavity_q": _recommendation_provenance(papers, "cavity_q", recommended_cavity_q),
+            "waveguide_width_um": _recommendation_provenance(papers, "waveguide_width_um", recommended_waveguide),
+            "t2_us": _recommendation_provenance(papers, "t2_us", recommended_t2),
+            "magnetic_field_mT": _recommendation_provenance(papers, "magnetic_field_mT", recommended_field),
+            "temperature_k": _recommendation_provenance(papers, "temperature_k", recommended_temp),
+            "pitch_um": _topic_recommendation_provenance(papers, recommended_pitch, {"photonics", "fabrication", "network"}, "pitch_prior"),
+            "optical_bus_ratio": _topic_recommendation_provenance(papers, recommended_bus_ratio, {"photonics", "network"}, "bus_ratio_prior"),
+        },
     )
 
 
@@ -513,6 +601,7 @@ def write_paper_artifacts(output_dir: Path, paper_knowledge: PaperKnowledge, inc
         f"- Application: `{paper_knowledge.application}`",
         f"- Crawled papers: `{len(paper_knowledge.papers)}`",
         f"- Semantic focus: `{', '.join(paper_knowledge.semantic_focus_terms)}`",
+        f"- Query terms: `{json.dumps(paper_knowledge.query_terms, ensure_ascii=False)}`",
         "",
         "## Aggregated Priors",
         "",
@@ -523,6 +612,7 @@ def write_paper_artifacts(output_dir: Path, paper_knowledge: PaperKnowledge, inc
         f"- Recommended temperature (K): `{paper_knowledge.recommended_temp_k:.2f}`",
         f"- Recommended pitch (um): `{paper_knowledge.recommended_pitch_um:.2f}`",
         f"- Recommended optical bus ratio: `{paper_knowledge.recommended_optical_bus_ratio:.3f}`",
+        f"- Recommendation provenance: `{json.dumps(paper_knowledge.recommendation_provenance, ensure_ascii=False)}`",
         "",
         "## Papers",
         "",
