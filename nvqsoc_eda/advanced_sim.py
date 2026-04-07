@@ -23,7 +23,7 @@ from .dense_placement import (
     simulate_dense_crosstalk,
     write_dense_placement_artifacts,
 )
-from .layout import LayoutBundle, generate_layout
+from .layout import LayoutBundle, estimate_power_mesh_ir_drop, generate_layout
 from .physics import readout_photon_counts
 from .qec import QECPlan, build_qec_plan
 from .simulator import CandidateDesign, SimulationMetrics
@@ -112,6 +112,9 @@ class PowerGridSummary:
     mean_drop_mV: float
     hotspot_x_norm: float
     hotspot_y_norm: float
+    mesh_nodes: int = 0
+    mesh_edges: int = 0
+    analysis_mode: str = "proxy"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -466,6 +469,38 @@ def _thermal_map(candidate: CandidateDesign, metrics: SimulationMetrics, plot_di
     )
 
 
+def _optimal_photon_threshold(bright: np.ndarray, dark: np.ndarray) -> tuple[int, float]:
+    if bright.size == 0 or dark.size == 0:
+        return 0, 0.0
+    min_count = int(min(np.min(bright), np.min(dark)))
+    max_count = int(max(np.max(bright), np.max(dark)))
+    span = max_count - min_count + 1
+    bright_hist = np.bincount((bright.astype(np.int64) - min_count), minlength=span)
+    dark_hist = np.bincount((dark.astype(np.int64) - min_count), minlength=span)
+
+    bright_prefix = np.empty(span + 1, dtype=np.int64)
+    dark_prefix = np.empty(span + 1, dtype=np.int64)
+    bright_prefix[0] = 0
+    dark_prefix[0] = 0
+    np.cumsum(bright_hist, out=bright_prefix[1:])
+    np.cumsum(dark_hist, out=dark_prefix[1:])
+
+    bright_ge = bright.size - bright_prefix[:-1]
+    dark_lt = dark_prefix[:-1]
+    fidelities = 0.5 * (bright_ge / float(bright.size) + dark_lt / float(dark.size))
+    best_index = int(np.argmax(fidelities))
+    return min_count + best_index, float(fidelities[best_index])
+
+
+def _photon_histogram_bins(bright: np.ndarray, dark: np.ndarray, *, max_bins: int = 256) -> np.ndarray:
+    min_count = int(min(np.min(bright), np.min(dark)))
+    max_count = int(max(np.max(bright), np.max(dark)))
+    span = max_count - min_count + 1
+    if span <= max_bins:
+        return np.arange(min_count, max_count + 2)
+    return np.linspace(min_count, max_count + 1, num=max_bins + 1)
+
+
 def _photon_statistics(spec: DesignSpec, candidate: CandidateDesign, metrics: SimulationMetrics, plot_dir: Path, label: str, seed: int) -> tuple[PhotonStatisticsSummary, str]:
     rng = np.random.default_rng(seed)
     bright_mean = readout_photon_counts(
@@ -479,20 +514,11 @@ def _photon_statistics(spec: DesignSpec, candidate: CandidateDesign, metrics: Si
     dark_mean = max(1.5, bright_mean * (1.0 - contrast) + 2.0 + candidate.amplifier_noise_temp_k)
     bright = rng.poisson(bright_mean, size=6000)
     dark = rng.poisson(dark_mean, size=6000)
-    thresholds = range(int(min(bright.min(), dark.min())), int(max(bright.max(), dark.max())) + 1)
-    best_threshold = 0
-    best_fidelity = 0.0
-    for threshold in thresholds:
-        bright_correct = np.mean(bright >= threshold)
-        dark_correct = np.mean(dark < threshold)
-        fidelity = 0.5 * (bright_correct + dark_correct)
-        if fidelity > best_fidelity:
-            best_fidelity = float(fidelity)
-            best_threshold = int(threshold)
+    best_threshold, best_fidelity = _optimal_photon_threshold(bright, dark)
     shot_margin = float((np.mean(bright) - np.mean(dark)) / max(np.std(bright) + np.std(dark), 1e-6))
     plot_path = plot_dir / f"{label}_photon_hist.png"
     fig, ax = plt.subplots(figsize=(7.6, 4.8))
-    bins = np.arange(int(min(dark.min(), bright.min())), int(max(dark.max(), bright.max())) + 2)
+    bins = _photon_histogram_bins(bright, dark)
     ax.hist(dark, bins=bins, alpha=0.55, label="dark", color="#457b9d", density=True)
     ax.hist(bright, bins=bins, alpha=0.55, label="bright", color="#f4a261", density=True)
     ax.axvline(best_threshold, color="#e63946", linestyle="--", linewidth=1.3)
@@ -584,60 +610,42 @@ def _phase_noise_spectrum(candidate: CandidateDesign, metrics: SimulationMetrics
     return NoiseSpectrumSummary(rms_jitter_ps, integrated, noise_floor_db, dephasing_proxy), str(plot_path)
 
 
-def _power_grid_ir_drop(candidate: CandidateDesign, metrics: SimulationMetrics, topology_plan: TopologyPlan, plot_dir: Path, label: str) -> tuple[PowerGridSummary, str]:
-    grid = 34
-    total = grid * grid
-    rows = []
-    cols = []
-    data = []
-    rhs = np.zeros(total, dtype=float)
-
-    def idx(r: int, c: int) -> int:
-        return r * grid + c
-
-    source_regions = [
-        (2, 7, 8, grid - 8, 0.18 * metrics.power_mw),
-        (grid - 7, grid - 2, 8, grid - 8, 0.18 * metrics.power_mw),
-        (10, grid - 10, 10, grid - 10, 0.24 * metrics.power_mw),
-    ]
-    for x0, x1, y0, y1, value in source_regions:
-        for r in range(y0, y1):
-            for c in range(x0, x1):
-                rhs[idx(r, c)] += value / max((x1 - x0) * (y1 - y0), 1)
-
-    conductance = 1.0 + 0.10 * candidate.metal_layers + 0.08 * topology_plan.route_width_scale
-    for r in range(grid):
-        for c in range(grid):
-            node = idx(r, c)
-            if r in {0, grid - 1} or c in {0, grid - 1}:
-                rows.append(node)
-                cols.append(node)
-                data.append(1.0)
-                rhs[node] = 0.0
-                continue
-            rows.append(node)
-            cols.append(node)
-            data.append(4.0 * conductance)
-            for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-                rows.append(node)
-                cols.append(idx(nr, nc))
-                data.append(-conductance)
-    matrix = sparse.csr_matrix((data, (rows, cols)), shape=(total, total))
-    voltage_drop = spla.spsolve(matrix, rhs).reshape((grid, grid))
-    voltage_drop -= voltage_drop.min()
-    voltage_drop *= (0.18 + 0.04 * candidate.control_mux_factor)
-    worst_drop = float(np.max(voltage_drop) * 1000.0)
-    mean_drop = float(np.mean(voltage_drop) * 1000.0)
-    hotspot = np.unravel_index(int(np.argmax(voltage_drop)), voltage_drop.shape)
+def _power_grid_ir_drop(layout: LayoutBundle, candidate: CandidateDesign, metrics: SimulationMetrics, plot_dir: Path, label: str) -> tuple[PowerGridSummary, str]:
+    mesh = estimate_power_mesh_ir_drop(layout, candidate, metrics)
+    hotspot_x = float(mesh.get("hotspot_x_norm", 0.5))
+    hotspot_y = float(mesh.get("hotspot_y_norm", 0.5))
+    drop_map = np.asarray(mesh.get("voltage_map_mV", []), dtype=float)
+    grid_x_um = np.asarray(mesh.get("grid_x_um", []), dtype=float)
+    grid_y_um = np.asarray(mesh.get("grid_y_um", []), dtype=float)
+    if drop_map.size == 0:
+        drop_map = np.zeros((2, 2), dtype=float)
+    if grid_x_um.size == 0:
+        grid_x_um = np.linspace(0.0, layout.die_width_um, drop_map.shape[1])
+    if grid_y_um.size == 0:
+        grid_y_um = np.linspace(0.0, layout.die_height_um, drop_map.shape[0])
     plot_path = plot_dir / f"{label}_ir_drop.png"
     fig, ax = plt.subplots(figsize=(5.8, 5.0))
-    im = ax.imshow(voltage_drop * 1000.0, cmap="magma", origin="lower")
-    ax.set_title("Power Grid IR Drop")
+    extent = [float(grid_x_um.min()), float(grid_x_um.max()), float(grid_y_um.min()), float(grid_y_um.max())]
+    im = ax.imshow(drop_map, cmap="magma", origin="lower", extent=extent, aspect="auto")
+    ax.set_title("Sparse Power Grid IR Drop")
+    ax.set_xlabel("X (um)")
+    ax.set_ylabel("Y (um)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="mV")
     fig.tight_layout()
     fig.savefig(plot_path, dpi=180)
     plt.close(fig)
-    return PowerGridSummary(worst_drop, mean_drop, float(hotspot[1] / (grid - 1)), float(hotspot[0] / (grid - 1))), str(plot_path)
+    return (
+        PowerGridSummary(
+            worst_drop_mV=float(mesh.get("worst_drop_mV", 0.0)),
+            mean_drop_mV=float(mesh.get("mean_drop_mV", 0.0)),
+            hotspot_x_norm=hotspot_x,
+            hotspot_y_norm=hotspot_y,
+            mesh_nodes=int(mesh.get("mesh_nodes", 0)),
+            mesh_edges=int(mesh.get("mesh_edges", 0)),
+            analysis_mode=str(mesh.get("analysis_mode", "layout_topology_mapped")),
+        ),
+        str(plot_path),
+    )
 
 
 def _entanglement_link(spec: DesignSpec, candidate: CandidateDesign, metrics: SimulationMetrics, qec_plan: QECPlan, plot_dir: Path, label: str) -> tuple[EntanglementSummary, str]:
@@ -796,21 +804,26 @@ def _geometry_from_layout(layout: LayoutBundle) -> GeometryDRCSummary:
     for circle in layout.circles:
         shapes.append((circle.layer, Point(circle.cx, circle.cy).buffer(circle.radius)))
 
+    density_recompute = dict(layout.stats.get("density_recompute", {}))
+    after_fill = dict(density_recompute.get("after_fill", {}))
     densities = []
-    windows_x = 5
-    windows_y = 5
-    win_w = layout.die_width_um / windows_x
-    win_h = layout.die_height_um / windows_y
-    metal_geoms = [geom for layer, geom in shapes if layer in metal_layers]
-    for wx in range(windows_x):
-        for wy in range(windows_y):
-            window = box(wx * win_w, wy * win_h, (wx + 1) * win_w, (wy + 1) * win_h)
-            metal_area = 0.0
-            for geom in metal_geoms:
-                inter = geom.intersection(window)
-                if not inter.is_empty:
-                    metal_area += inter.area
-            densities.append(metal_area / max(window.area, 1e-6))
+    if after_fill:
+        densities = [float(after_fill.get("density_min", 0.0)), float(after_fill.get("density_max", 0.0))]
+    else:
+        windows_x = 5
+        windows_y = 5
+        win_w = layout.die_width_um / windows_x
+        win_h = layout.die_height_um / windows_y
+        metal_geoms = [geom for layer, geom in shapes if layer in metal_layers]
+        for wx in range(windows_x):
+            for wy in range(windows_y):
+                window = box(wx * win_w, wy * win_h, (wx + 1) * win_w, (wy + 1) * win_h)
+                metal_area = 0.0
+                for geom in metal_geoms:
+                    inter = geom.intersection(window)
+                    if not inter.is_empty:
+                        metal_area += inter.area
+                densities.append(metal_area / max(window.area, 1e-6))
 
     via_count = sum(count for layer, count in layout.stats.get("rect_count_by_layer", {}).items() if layer.startswith("VIA"))
     via_density = via_count / max((layout.die_width_um * layout.die_height_um) / 1.0e6, 1e-6)
@@ -859,12 +872,12 @@ def evaluate_candidate_with_open_source_sims(
     photon_summary, photon_plot = _photon_statistics(spec, candidate, metrics, output_dir, label, seed)
     control_summary, control_plot = _control_loop_response(candidate, metrics, output_dir, label)
     noise_summary, noise_plot = _phase_noise_spectrum(candidate, metrics, output_dir, label, seed)
-    power_grid_summary, power_grid_plot = _power_grid_ir_drop(candidate, metrics, topology_plan, output_dir, label)
+    layout = generate_layout(spec, candidate, metrics, topology_plan=topology_plan, placement=plan, qec_plan=qec_plan)
+    power_grid_summary, power_grid_plot = _power_grid_ir_drop(layout, candidate, metrics, output_dir, label)
     entanglement_summary, entanglement_plot = _entanglement_link(spec, candidate, metrics, qec_plan, output_dir, label)
     error_channel_summary, error_plot = _error_channel_bundle(spec, metrics, dense_crosstalk, qec_plan, output_dir, label)
     routing_summary, routing_plot = _routing_graph(candidate, metrics, plan, output_dir, label)
     optical_summary, optical_plot = _optical_spectrum(spec, candidate, metrics, output_dir, label)
-    layout = generate_layout(spec, candidate, metrics, topology_plan=topology_plan, placement=plan, qec_plan=qec_plan)
     geometry_summary = _geometry_from_layout(layout)
     placement_summary = PlacementSummary(
         placement_score=plan.placement_score,
@@ -880,7 +893,8 @@ def evaluate_candidate_with_open_source_sims(
     microwave_term = max(0.0, min(1.2, 1.12 - abs(microwave_summary.center_s21_db) / 16.0 - max(microwave_summary.vswr - 1.0, 0.0) / 8.0))
     control_term = max(0.0, min(1.2, 1.10 - control_summary.overshoot_pct / 80.0 - max(0.0, 45.0 - control_summary.phase_margin_deg) / 120.0))
     noise_term = max(0.0, min(1.2, 1.08 - 0.30 * noise_summary.dephasing_proxy - noise_summary.rms_jitter_ps / 200.0))
-    power_term = max(0.0, min(1.2, 1.10 - power_grid_summary.worst_drop_mV / 180.0))
+    ir_drop_threshold_mV = float(layout.drc.get("ir_drop_penalty_threshold_mV", 500.0))
+    power_term = max(0.0, min(1.2, 1.10 - power_grid_summary.worst_drop_mV / max(ir_drop_threshold_mV, 1e-6)))
     entanglement_term = max(0.0, min(1.2, 0.70 * entanglement_summary.repeater_link_margin + 0.30 * entanglement_summary.error_mitigation_gain))
     error_term = max(0.0, min(1.2, 1.10 - 1.6 * error_channel_summary.decoder_failure_proxy - 0.6 * error_channel_summary.correlated_error))
     routing_term = max(0.0, min(1.2, 1.10 - 0.18 * max(routing_summary.congestion_ratio - 1.0, 0.0)))
@@ -889,6 +903,9 @@ def evaluate_candidate_with_open_source_sims(
     placement_term = max(0.0, min(1.2, 0.85 * placement_summary.min_spacing_um / max(candidate.cell_pitch_um, 1e-6) + 0.35 * placement_summary.placement_score))
     crosstalk_term = max(0.0, min(1.2, 1.05 - 2.8 * dense_crosstalk.effective_crosstalk_linear - 0.18 * dense_crosstalk.spectral_radius))
     constraint_penalty = 0.18 * len(metrics.constraint_violations)
+    ir_drop_penalty = 0.0
+    if power_grid_summary.worst_drop_mV > ir_drop_threshold_mV:
+        ir_drop_penalty = 0.35 + 0.0015 * (power_grid_summary.worst_drop_mV - ir_drop_threshold_mV)
     composite_score = (
         base_score
         + 0.11 * qutip_term
@@ -906,6 +923,7 @@ def evaluate_candidate_with_open_source_sims(
         + 0.05 * placement_term
         + 0.08 * crosstalk_term
         - constraint_penalty
+        - ir_drop_penalty
     )
     bundle = AdvancedSimulationBundle(
         candidate_key=label,
