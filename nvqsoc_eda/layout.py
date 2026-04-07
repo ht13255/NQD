@@ -9,6 +9,9 @@ from typing import Any
 import gdstk
 import matplotlib
 import numpy as np
+from scipy import sparse
+from scipy.sparse import linalg as spla
+from shapely.geometry import LineString, Point, box
 
 from .dense_placement import PlacementPlan, base_layout_frame, build_probabilistic_placement
 from .qec import QECPlan
@@ -35,6 +38,15 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _layout_performance_scales(qubits: int) -> tuple[float, float, float]:
+    load_factor = max(1.0, qubits / 64.0)
+    pressure = min(3.0, load_factor - 1.0)
+    fence_pitch_scale = 1.0 + 0.22 * pressure
+    fill_pitch_scale = 1.0 + 0.34 * pressure
+    via_density_scale = max(0.68, 1.0 - 0.12 * pressure)
+    return fence_pitch_scale, fill_pitch_scale, via_density_scale
+
+
 LAYER_MAP = {
     "DIE": (1, 0),
     "SCRIBE": (2, 0),
@@ -56,6 +68,7 @@ LAYER_MAP = {
     "M6": (20, 0),
     "RESONATOR": (30, 0),
     "OPTICAL": (40, 0),
+    "LASER": (41, 0),
     "READOUT": (50, 0),
     "DETECTOR": (51, 0),
     "FILL": (60, 0),
@@ -88,6 +101,7 @@ LAYER_COLORS = {
     "M6": "#c92a2a",
     "RESONATOR": "#118ab2",
     "OPTICAL": "#ffb703",
+    "LASER": "#d9480f",
     "READOUT": "#ef476f",
     "DETECTOR": "#f28482",
     "FILL": "#ced4da",
@@ -211,9 +225,10 @@ def _add_cross_marker(bundle: LayoutBundle, name: str, cx: float, cy: float, spa
 
 def _add_via_array(bundle: LayoutBundle, prefix: str, x: float, y: float, cols: int, rows: int, pitch: float, size: float, layer: str) -> int:
     count = 0
+    append_rect = bundle.rects.append
     for row in range(rows):
         for col in range(cols):
-            bundle.rects.append(_rect(f"{prefix}_{row}_{col}", x + col * pitch, y + row * pitch, size, size, layer))
+            append_rect(_rect(f"{prefix}_{row}_{col}", x + col * pitch, y + row * pitch, size, size, layer))
             count += 1
     return count
 
@@ -238,19 +253,34 @@ def _add_guard_ring(bundle: LayoutBundle, name: str, x: float, y: float, width: 
 
 
 def _add_shield_fence(bundle: LayoutBundle, name: str, x0: float, y0: float, x1: float, y1: float, pitch: float = 24.0) -> int:
+    if pitch <= 0.0:
+        return 0
     count = 0
+    append_rect = bundle.rects.append
     if abs(y1 - y0) < 1e-6:
-        x = min(x0, x1)
-        while x <= max(x0, x1):
-            bundle.rects.append(_rect(f"{name}_{count}", x - 1.6, y0 - 1.6, 3.2, 3.2, "GROUND"))
+        start_x = min(x0, x1)
+        end_x = max(x0, x1)
+        span = end_x - start_x
+        steps = max(0, int(math.floor(span / pitch)))
+        for step in range(steps + 1):
+            x = start_x + step * pitch
+            append_rect(_rect(f"{name}_{count}", x - 1.6, y0 - 1.6, 3.2, 3.2, "GROUND"))
             count += 1
-            x += pitch
+        if span - steps * pitch > 1e-6:
+            append_rect(_rect(f"{name}_{count}", end_x - 1.6, y0 - 1.6, 3.2, 3.2, "GROUND"))
+            count += 1
     elif abs(x1 - x0) < 1e-6:
-        y = min(y0, y1)
-        while y <= max(y0, y1):
-            bundle.rects.append(_rect(f"{name}_{count}", x0 - 1.6, y - 1.6, 3.2, 3.2, "GROUND"))
+        start_y = min(y0, y1)
+        end_y = max(y0, y1)
+        span = end_y - start_y
+        steps = max(0, int(math.floor(span / pitch)))
+        for step in range(steps + 1):
+            y = start_y + step * pitch
+            append_rect(_rect(f"{name}_{count}", x0 - 1.6, y - 1.6, 3.2, 3.2, "GROUND"))
             count += 1
-            y += pitch
+        if span - steps * pitch > 1e-6:
+            append_rect(_rect(f"{name}_{count}", x0 - 1.6, end_y - 1.6, 3.2, 3.2, "GROUND"))
+            count += 1
     return count
 
 
@@ -268,20 +298,382 @@ def _add_square_resonator(bundle: LayoutBundle, name: str, cx: float, cy: float,
 
 
 def _add_fill_region(bundle: LayoutBundle, name: str, x: float, y: float, width: float, height: float, pitch: float = 120.0) -> int:
-    if width <= 0.0 or height <= 0.0:
+    if width <= 0.0 or height <= 0.0 or pitch <= 0.0:
         return 0
-    fill_size = pitch * 0.42
+    effective_pitch = max(48.0, pitch)
+    fill_size = effective_pitch * 0.42
+    rows = max(1, int(height // effective_pitch))
+    cols = max(1, int(width // effective_pitch))
+    append_rect = bundle.rects.append
     count = 0
-    rows = max(1, int(height // pitch))
-    cols = max(1, int(width // pitch))
     for row in range(rows):
-        for col in range(cols):
-            if (row + col) % 2 == 0:
-                rx = x + col * pitch + 0.5 * (pitch - fill_size)
-                ry = y + row * pitch + 0.5 * (pitch - fill_size)
-                bundle.rects.append(_rect(f"{name}_{row}_{col}", rx, ry, fill_size, fill_size, "FILL"))
-                count += 1
+        ry = y + row * effective_pitch + 0.5 * (effective_pitch - fill_size)
+        start_col = row % 2
+        for col in range(start_col, cols, 2):
+            rx = x + col * effective_pitch + 0.5 * (effective_pitch - fill_size)
+            append_rect(_rect(f"{name}_{row}_{col}", rx, ry, fill_size, fill_size, "FILL"))
+            count += 1
     return count
+
+
+def _density_window_origin(layout: LayoutBundle, candidate: CandidateDesign) -> tuple[float, float]:
+    nv_x = [circle.cx for circle in layout.circles if circle.layer == "NV"]
+    nv_y = [circle.cy for circle in layout.circles if circle.layer == "NV"]
+    if nv_x and nv_y:
+        return min(nv_x) - 0.5 * candidate.cell_pitch_um, min(nv_y) - 0.5 * candidate.cell_pitch_um
+    return 0.0, 0.0
+
+
+def _density_window_axis(origin: float, window_size_um: float, limit_um: float) -> list[float]:
+    start = origin
+    while start > 0.0:
+        start -= window_size_um
+    starts: list[float] = []
+    cursor = start
+    while cursor < limit_um:
+        starts.append(cursor)
+        cursor += window_size_um
+    return starts or [0.0]
+
+
+def recompute_layout_density(layout: LayoutBundle, candidate: CandidateDesign, *, include_fill: bool) -> dict[str, Any]:
+    window_pitch_cells = max(8, int(math.ceil(220.0 / max(candidate.cell_pitch_um, 1e-6))))
+    window_size_um = candidate.cell_pitch_um * window_pitch_cells
+    origin_x, origin_y = _density_window_origin(layout, candidate)
+    window_starts_x = _density_window_axis(origin_x, window_size_um, layout.die_width_um)
+    window_starts_y = _density_window_axis(origin_y, window_size_um, layout.die_height_um)
+    windows_x = len(window_starts_x)
+    windows_y = len(window_starts_y)
+    metal_layers = {"GROUND", "M1", "M2", "M3", "M4", "M5", "M6", "RESONATOR", "OPTICAL", "READOUT", "DETECTOR"}
+    if include_fill:
+        metal_layers.add("FILL")
+    densities_by_layer = {layer: np.zeros((windows_y, windows_x), dtype=float) for layer in metal_layers}
+
+    def accumulate_box(layer: str, x: float, y: float, width: float, height: float, scale: float = 1.0) -> None:
+        if width <= 0.0 or height <= 0.0:
+            return
+        x1 = x + width
+        y1 = y + height
+        col0 = max(0, int(math.floor((x - window_starts_x[0]) / window_size_um)))
+        row0 = max(0, int(math.floor((y - window_starts_y[0]) / window_size_um)))
+        col1 = min(windows_x - 1, int(math.floor((max(x1 - 1e-6, x) - window_starts_x[0]) / window_size_um)))
+        row1 = min(windows_y - 1, int(math.floor((max(y1 - 1e-6, y) - window_starts_y[0]) / window_size_um)))
+        for row in range(row0, row1 + 1):
+            wy0 = max(window_starts_y[row], 0.0)
+            wy1 = min(window_starts_y[row] + window_size_um, layout.die_height_um)
+            overlap_h = max(0.0, min(y1, wy1) - max(y, wy0))
+            if overlap_h <= 0.0:
+                continue
+            for col in range(col0, col1 + 1):
+                wx0 = max(window_starts_x[col], 0.0)
+                wx1 = min(window_starts_x[col] + window_size_um, layout.die_width_um)
+                overlap_w = max(0.0, min(x1, wx1) - max(x, wx0))
+                if overlap_w > 0.0:
+                    densities_by_layer[layer][row, col] += overlap_w * overlap_h * scale
+
+    for rect in layout.rects:
+        if rect.layer in metal_layers:
+            accumulate_box(rect.layer, rect.x, rect.y, rect.width, rect.height)
+    for route in layout.routes:
+        if route.layer not in metal_layers:
+            continue
+        xs = [point[0] for point in route.points]
+        ys = [point[1] for point in route.points]
+        accumulate_box(route.layer, min(xs) - route.width / 2.0, min(ys) - route.width / 2.0, max(xs) - min(xs) + route.width, max(ys) - min(ys) + route.width, scale=0.68)
+    for circle in layout.circles:
+        if circle.layer not in metal_layers:
+            continue
+        accumulate_box(circle.layer, circle.cx - circle.radius, circle.cy - circle.radius, 2.0 * circle.radius, 2.0 * circle.radius, scale=math.pi / 4.0)
+
+    density_values: list[float] = []
+    density_windows: list[dict[str, Any]] = []
+    for row in range(windows_y):
+        wy0 = max(window_starts_y[row], 0.0)
+        wy1 = min(window_starts_y[row] + window_size_um, layout.die_height_um)
+        for col in range(windows_x):
+            wx0 = max(window_starts_x[col], 0.0)
+            wx1 = min(window_starts_x[col] + window_size_um, layout.die_width_um)
+            window_area = max((wx1 - wx0) * (wy1 - wy0), 1e-6)
+            per_layer_density = {layer: float(min(values[row, col] / window_area, 1.0)) for layer, values in densities_by_layer.items()}
+            dominant_layer, density = max(per_layer_density.items(), key=lambda item: item[1])
+            density_values.append(density)
+            density_windows.append(
+                {
+                    "row": row,
+                    "col": col,
+                    "x0_um": wx0,
+                    "x1_um": wx1,
+                    "y0_um": wy0,
+                    "y1_um": wy1,
+                    "density": density,
+                    "dominant_layer": dominant_layer,
+                }
+            )
+    density_windows.sort(key=lambda item: item["density"], reverse=True)
+    return {
+        "include_fill": include_fill,
+        "window_size_um": window_size_um,
+        "window_pitch_cells": window_pitch_cells,
+        "window_count_x": windows_x,
+        "window_count_y": windows_y,
+        "window_origin_x_um": max(window_starts_x[0], 0.0),
+        "window_origin_y_um": max(window_starts_y[0], 0.0),
+        "normalized_to_cell_pitch": True,
+        "cell_pitch_um": candidate.cell_pitch_um,
+        "density_min": float(min(density_values) if density_values else 0.0),
+        "density_max": float(max(density_values) if density_values else 0.0),
+        "density_windows": density_windows,
+    }
+
+
+def _trim_fill_to_density_limit(bundle: LayoutBundle, candidate: CandidateDesign, *, density_limit: float = 1.0) -> tuple[int, dict[str, Any]]:
+    trimmed = 0
+    density = recompute_layout_density(bundle, candidate, include_fill=True)
+    for _ in range(8):
+        if density.get("density_max", 0.0) <= density_limit + 1e-9:
+            break
+        windows = [item for item in density.get("density_windows", []) if item.get("density", 0.0) > density_limit]
+        if not windows:
+            windows = density.get("density_windows", [])[:1]
+        offending_indices: list[int] = []
+        for index, rect in enumerate(bundle.rects):
+            if rect.layer != "FILL":
+                continue
+            cx = rect.x + 0.5 * rect.width
+            cy = rect.y + 0.5 * rect.height
+            if any(window["x0_um"] <= cx < window["x1_um"] and window["y0_um"] <= cy < window["y1_um"] for window in windows):
+                offending_indices.append(index)
+        if not offending_indices:
+            break
+        drop_indices = set(offending_indices[::2] or offending_indices[-1:])
+        bundle.rects = [rect for index, rect in enumerate(bundle.rects) if index not in drop_indices]
+        trimmed += len(drop_indices)
+        density = recompute_layout_density(bundle, candidate, include_fill=True)
+    return trimmed, density
+
+
+def _mesh_track_coordinate(route: Route, *, vertical: bool) -> float | None:
+    xs = [point[0] for point in route.points]
+    ys = [point[1] for point in route.points]
+    if vertical and max(xs) - min(xs) <= max(route.width * 0.5, 8.0):
+        return float(sum(xs) / len(xs))
+    if not vertical and max(ys) - min(ys) <= max(route.width * 0.5, 8.0):
+        return float(sum(ys) / len(ys))
+    return None
+
+
+def estimate_power_mesh_ir_drop(layout: LayoutBundle, candidate: CandidateDesign, metrics: SimulationMetrics) -> dict[str, Any]:
+    vertical_tracks: dict[float, float] = {}
+    horizontal_tracks: dict[float, float] = {}
+    for route in layout.routes:
+        if route.name.startswith("m6_grid_") or route.name.startswith("power_trunk_v_"):
+            coord = _mesh_track_coordinate(route, vertical=True)
+            if coord is not None:
+                vertical_tracks[coord] = max(vertical_tracks.get(coord, 0.0), route.width)
+        if route.name.startswith("m5_grid_") or route.name.startswith("power_trunk_h_"):
+            coord = _mesh_track_coordinate(route, vertical=False)
+            if coord is not None:
+                horizontal_tracks[coord] = max(horizontal_tracks.get(coord, 0.0), route.width)
+    if not vertical_tracks or not horizontal_tracks:
+        return {
+            "worst_drop_mV": 0.0,
+            "mean_drop_mV": 0.0,
+            "hotspot_x_norm": 0.5,
+            "hotspot_y_norm": 0.5,
+            "mesh_nodes": 0,
+            "mesh_edges": 0,
+            "analysis_mode": "no_mesh",
+            "grid_x_um": [],
+            "grid_y_um": [],
+            "voltage_map_mV": [],
+        }
+
+    xs = sorted(vertical_tracks)
+    ys = sorted(horizontal_tracks)
+    cols_count = len(xs)
+    rows_count = len(ys)
+    total_nodes = rows_count * cols_count
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    rhs = np.zeros(total_nodes, dtype=float)
+
+    def node_index(row: int, col: int) -> int:
+        return row * cols_count + col
+
+    def add_edge(a: int, b: int, conductance: float) -> None:
+        rows.extend([a, a, b, b])
+        cols.extend([a, b, b, a])
+        data.extend([conductance, -conductance, conductance, -conductance])
+
+    for row in range(rows_count):
+        for col in range(cols_count):
+            node = node_index(row, col)
+            if row == 0 or row == rows_count - 1 or col == 0 or col == cols_count - 1:
+                rows.append(node)
+                cols.append(node)
+                data.append(1.0)
+                rhs[node] = 0.0
+                continue
+            if col + 1 < cols_count:
+                dx = max(xs[col + 1] - xs[col], 1.0)
+                conductance = max(0.02, 45.0 * horizontal_tracks[ys[row]] / dx)
+                add_edge(node, node_index(row, col + 1), conductance)
+            if row + 1 < rows_count:
+                dy = max(ys[row + 1] - ys[row], 1.0)
+                conductance = max(0.02, 45.0 * vertical_tracks[xs[col]] / dy)
+                add_edge(node, node_index(row + 1, col), conductance)
+
+    load_rects: list[tuple[float, float, float]] = []
+    for rect in layout.rects:
+        weight = 0.0
+        if rect.name.startswith("tile_"):
+            weight = 1.0
+        elif "ctrl_bank" in rect.name or rect.name.startswith("left_ctrl_seg_") or rect.name.startswith("right_ctrl_seg_"):
+            weight = 5.5
+        elif rect.name.startswith("readout_macro") or rect.name.startswith("readout_seg_"):
+            weight = 6.0
+        elif rect.name.startswith("laser_"):
+            weight = 2.0
+        elif rect.name.startswith("factory_"):
+            weight = 2.8
+        elif rect.name.startswith("top_") and rect.layer == "M5":
+            weight = 1.8
+        if weight > 0.0:
+            load_rects.append((rect.x + rect.width / 2.0, rect.y + rect.height / 2.0, weight))
+    total_weight = sum(weight for _x, _y, weight in load_rects) or 1.0
+    for cx, cy, weight in load_rects:
+        col = min(range(cols_count), key=lambda idx: abs(xs[idx] - cx))
+        row = min(range(rows_count), key=lambda idx: abs(ys[idx] - cy))
+        rhs[node_index(row, col)] += metrics.power_mw * (weight / total_weight)
+
+    matrix = sparse.csr_matrix((data, (rows, cols)), shape=(total_nodes, total_nodes))
+    voltage_drop = spla.spsolve(matrix, rhs).reshape((rows_count, cols_count))
+    voltage_drop -= voltage_drop.min()
+    voltage_drop *= 0.65
+    hotspot = np.unravel_index(int(np.argmax(voltage_drop)), voltage_drop.shape)
+    return {
+        "worst_drop_mV": float(np.max(voltage_drop)),
+        "mean_drop_mV": float(np.mean(voltage_drop)),
+        "hotspot_x_norm": float(xs[hotspot[1]] / max(layout.die_width_um, 1e-6)),
+        "hotspot_y_norm": float(ys[hotspot[0]] / max(layout.die_height_um, 1e-6)),
+        "mesh_nodes": total_nodes,
+        "mesh_edges": max((len(data) - total_nodes) // 4, 0),
+        "analysis_mode": "sparse_topology_grid",
+        "grid_x_um": [float(value) for value in xs],
+        "grid_y_um": [float(value) for value in ys],
+        "voltage_map_mV": [[float(value) for value in row] for row in voltage_drop],
+    }
+
+
+def _reinforce_power_mesh(
+    bundle: LayoutBundle,
+    candidate: CandidateDesign,
+    metrics: SimulationMetrics,
+    topology_plan: TopologyPlan,
+    *,
+    core_x: float,
+    core_y: float,
+    array_width_um: float,
+    array_height_um: float,
+) -> dict[str, Any]:
+    analysis = estimate_power_mesh_ir_drop(bundle, candidate, metrics)
+    threshold_mV = 500.0
+    if analysis["worst_drop_mV"] <= threshold_mV:
+        return {"triggered": False, "threshold_mV": threshold_mV, "pre": analysis, "post": analysis, "added_via_count": 0, "added_trunks": 0}
+    hotspot_x = analysis["hotspot_x_norm"] * bundle.die_width_um
+    hotspot_y = analysis["hotspot_y_norm"] * bundle.die_height_um
+    added_via_count = 0
+    added_trunks = 0
+    severity = analysis["worst_drop_mV"] / max(threshold_mV, 1e-6)
+    trunk_width = 7.0 if severity <= 1.15 else 9.0 if severity <= 1.35 else 11.0
+    bundle.routes.append(_route([(hotspot_x, core_y - 260.0), (hotspot_x, core_y + array_height_um + 260.0)], trunk_width, f"power_trunk_v_{len(bundle.routes)}", "M3"))
+    bundle.routes.append(_route([(core_x - 260.0, hotspot_y), (core_x + array_width_um + 260.0, hotspot_y)], trunk_width, f"power_trunk_h_{len(bundle.routes)}", "M3"))
+    added_trunks += 2
+    if severity > 1.30:
+        bundle.routes.append(_route([(hotspot_x - 36.0, core_y - 220.0), (hotspot_x - 36.0, core_y + array_height_um + 220.0)], trunk_width, f"power_trunk_v_{len(bundle.routes)}", "M3"))
+        bundle.routes.append(_route([(core_x - 220.0, hotspot_y - 36.0), (core_x + array_width_um + 220.0, hotspot_y - 36.0)], trunk_width, f"power_trunk_h_{len(bundle.routes)}", "M3"))
+        added_trunks += 2
+    via_pitch = 4.0 if severity > 1.25 else 5.0
+    via_size = 2.0
+    via_cols = 4 + (1 if severity > 1.10 else 0) + (1 if severity > 1.35 else 0)
+    via_rows = 4 + (1 if severity > 1.10 else 0) + (1 if severity > 1.35 else 0)
+    via_sites = [
+        (hotspot_x - 10.0, hotspot_y - 10.0),
+        (topology_plan.left_bank_x_um + 80.0, hotspot_y - 10.0),
+        (topology_plan.right_bank_x_um + 80.0, hotspot_y - 10.0),
+    ]
+    if severity > 1.20:
+        via_sites.extend(
+            [
+                (hotspot_x - 24.0, topology_plan.photonics_header_y_um + 80.0),
+                (hotspot_x + 18.0, topology_plan.readout_macro_y_um + 60.0),
+            ]
+        )
+    for index, (vx, vy) in enumerate(via_sites):
+        added_via_count += _add_via_array(bundle, f"power_via_farm_{index}", max(vx, 120.0), max(vy, 120.0), via_cols, via_rows, via_pitch, via_size, "VIA3")
+    post = estimate_power_mesh_ir_drop(bundle, candidate, metrics)
+    return {
+        "triggered": True,
+        "threshold_mV": threshold_mV,
+        "pre": analysis,
+        "post": post,
+        "added_via_count": added_via_count,
+        "added_trunks": added_trunks,
+    }
+
+
+def _add_laser_bank(
+    bundle: LayoutBundle,
+    candidate: CandidateDesign,
+    topology_plan: TopologyPlan,
+    die_width_um: float,
+    optical_bus_xs: list[float],
+    route_width_scale: float,
+) -> tuple[int, int]:
+    if not optical_bus_xs:
+        return 0, 0
+    laser_count = max(2, min(12, candidate.optical_bus_count + max(1, candidate.control_mux_factor // 2)))
+    laser_count = min(laser_count, max(2, len(optical_bus_xs) * 2))
+    laser_width = 78.0
+    laser_height = 58.0
+    driver_height = 24.0
+    pitch = min(170.0, max(120.0, die_width_um / max(laser_count + 2, 3)))
+    start_x = 0.5 * (die_width_um - (laser_count - 1) * pitch - laser_width)
+    laser_y = topology_plan.photonics_header_y_um + 32.0
+    header_top = topology_plan.photonics_header_y_um + 220.0
+    if laser_y + laser_height + driver_height + 8.0 > header_top:
+        laser_y = max(topology_plan.photonics_header_y_um + 10.0, header_top - (laser_height + driver_height + 10.0))
+    feed_y = topology_plan.photonics_header_y_um + 112.0
+    append_rect = bundle.rects.append
+    append_route = bundle.routes.append
+    append_circle = bundle.circles.append
+    append_label = bundle.labels.append
+    for index in range(laser_count):
+        x = start_x + index * pitch
+        center_x = x + 0.5 * laser_width
+        append_rect(_rect(f"laser_source_{index}", x, laser_y, laser_width, laser_height, "LASER"))
+        append_rect(_rect(f"laser_driver_{index}", x + 8.0, laser_y + laser_height + 6.0, laser_width - 16.0, driver_height, "M3"))
+        append_circle(_circle(f"laser_resonator_{index}", center_x, laser_y + 0.5 * laser_height, 8.5, "LASER"))
+        append_label(_label(f"LASER{index}", x + 7.0, laser_y + laser_height - 8.0, 8.0, "LASER"))
+        target_x = min(optical_bus_xs, key=lambda bus_x: abs(bus_x - center_x))
+        append_route(
+            _route(
+                [(center_x, laser_y + laser_height), (center_x, feed_y), (target_x, feed_y)],
+                3.4 * route_width_scale,
+                f"laser_feed_{index}",
+                "LASER",
+            )
+        )
+        append_route(
+            _route(
+                [(target_x, feed_y), (target_x, topology_plan.photonics_header_y_um + 72.0)],
+                2.0 * route_width_scale,
+                f"laser_tap_{index}",
+                "OPTICAL",
+            )
+        )
+    return laser_count, laser_count
 
 
 def _route_length(points: list[tuple[float, float]]) -> float:
@@ -342,9 +734,12 @@ def generate_layout(
     optical_route_scale = max(0.75, topology_plan.optical_route_width_scale)
     resonator_trace_scale = max(0.70, topology_plan.resonator_trace_scale)
     keepout = topology_plan.keepout_margin_um
+    fence_pitch_scale, fill_pitch_scale, via_density_scale = _layout_performance_scales(candidate.qubits)
     via_count = 0
     fill_count = 0
     fence_count = 0
+    laser_count = 0
+    laser_driver_count = 0
     bundle = LayoutBundle(die_width_um=die_width_um, die_height_um=die_height_um)
 
     bundle.rects.extend(
@@ -444,8 +839,24 @@ def generate_layout(
         bundle.routes.append(_route(main_points, 14.0 * optical_route_scale, f"opt_bus_{bus}", "OPTICAL"))
         _add_grating_coupler(bundle, f"grating_{bus}", x - 18.0, 260.0, 36.0, 92.0, 9)
         bundle.routes.append(_route([(x, 352.0), (x, 260.0), (die_width_um / 2.0, 260.0)], 8.0 * route_width_scale, f"opt_backhaul_{bus}", "M3"))
-        fence_count += _add_shield_fence(bundle, f"opt_fence_left_{bus}", x - 22.0, core_y - 50.0, x - 22.0, core_y + array_height_um + 50.0, pitch=topology_plan.shield_pitch_um)
-        fence_count += _add_shield_fence(bundle, f"opt_fence_right_{bus}", x + 22.0, core_y - 50.0, x + 22.0, core_y + array_height_um + 50.0, pitch=topology_plan.shield_pitch_um)
+        fence_count += _add_shield_fence(
+            bundle,
+            f"opt_fence_left_{bus}",
+            x - 22.0,
+            core_y - 50.0,
+            x - 22.0,
+            core_y + array_height_um + 50.0,
+            pitch=max(8.0, topology_plan.shield_pitch_um * fence_pitch_scale),
+        )
+        fence_count += _add_shield_fence(
+            bundle,
+            f"opt_fence_right_{bus}",
+            x + 22.0,
+            core_y - 50.0,
+            x + 22.0,
+            core_y + array_height_um + 50.0,
+            pitch=max(8.0, topology_plan.shield_pitch_um * fence_pitch_scale),
+        )
         for redundancy in range(topology_plan.optical_redundancy):
             offset = (redundancy + 1) * topology_plan.bus_escape_offset_um * 0.35
             bundle.routes.append(
@@ -456,6 +867,15 @@ def generate_layout(
                     "M6",
                 )
             )
+
+    laser_count, laser_driver_count = _add_laser_bank(
+        bundle,
+        candidate,
+        topology_plan,
+        die_width_um,
+        optical_bus_xs,
+        route_width_scale,
+    )
 
     lane_ys = placement.microwave_lane_y_um
     for line, y_line in enumerate(lane_ys):
@@ -471,8 +891,24 @@ def generate_layout(
         bundle.routes.append(_route(sig_points, 10.0 * route_width_scale, f"mw_line_{line}", "M2"))
         bundle.routes.append(_route([(x0, y_line - 18.0), (x1, y_line - 18.0), (center_x, y_line - 18.0)], 6.0 * route_width_scale, f"mw_gnd_low_{line}", "GROUND"))
         bundle.routes.append(_route([(x0, y_line + 18.0), (x1, y_line + 18.0), (center_x, y_line + 18.0)], 6.0 * route_width_scale, f"mw_gnd_high_{line}", "GROUND"))
-        fence_count += _add_shield_fence(bundle, f"mw_sig_fence_low_{line}", x0, y_line - 28.0, center_x, y_line - 28.0, pitch=max(10.0, topology_plan.shield_pitch_um * 1.2))
-        fence_count += _add_shield_fence(bundle, f"mw_sig_fence_high_{line}", x0, y_line + 28.0, center_x, y_line + 28.0, pitch=max(10.0, topology_plan.shield_pitch_um * 1.2))
+        fence_count += _add_shield_fence(
+            bundle,
+            f"mw_sig_fence_low_{line}",
+            x0,
+            y_line - 28.0,
+            center_x,
+            y_line - 28.0,
+            pitch=max(10.0, topology_plan.shield_pitch_um * 1.2 * fence_pitch_scale),
+        )
+        fence_count += _add_shield_fence(
+            bundle,
+            f"mw_sig_fence_high_{line}",
+            x0,
+            y_line + 28.0,
+            center_x,
+            y_line + 28.0,
+            pitch=max(10.0, topology_plan.shield_pitch_um * 1.2 * fence_pitch_scale),
+        )
         for redundancy in range(topology_plan.microwave_redundancy):
             offset = (redundancy + 1) * 11.0
             bundle.routes.append(_route([(x0, y_line + offset), (center_x, y_line + offset)], 3.2 * route_width_scale, f"mw_return_{line}_{redundancy}", "M3"))
@@ -531,13 +967,20 @@ def generate_layout(
         bundle.routes.append(_route([(cx - 6.0, lane_y), (cx + 6.0, lane_y)], 1.8 * route_width_scale, f"mw_stub_{tile.qubit_id}", "M2"))
         bridge_layer = "M3" if tile.qubit_id % 2 == 0 else "M5"
         bundle.routes.append(_route([(cx, cy), (bus_x, cy)], 1.4 * route_width_scale, f"sense_bridge_{tile.qubit_id}", bridge_layer))
-        fence_pitch = max(8.0, topology_plan.shield_pitch_um)
+        fence_pitch = max(8.0, topology_plan.shield_pitch_um * fence_pitch_scale)
         fence_count += _add_shield_fence(bundle, f"tile_fence_l_{tile.qubit_id}", tile_x - keepout / 2.0 - 3.0, tile_y - keepout / 2.0, tile_x - keepout / 2.0 - 3.0, tile_y + tile_size + keepout / 2.0, pitch=fence_pitch)
         fence_count += _add_shield_fence(bundle, f"tile_fence_r_{tile.qubit_id}", tile_x + tile_size + keepout / 2.0 + 3.0, tile_y - keepout / 2.0, tile_x + tile_size + keepout / 2.0 + 3.0, tile_y + tile_size + keepout / 2.0, pitch=fence_pitch)
         fence_count += _add_shield_fence(bundle, f"tile_fence_t_{tile.qubit_id}", tile_x - keepout / 2.0, tile_y - keepout / 2.0 - 3.0, tile_x + tile_size + keepout / 2.0, tile_y - keepout / 2.0 - 3.0, pitch=fence_pitch)
         fence_count += _add_shield_fence(bundle, f"tile_fence_b_{tile.qubit_id}", tile_x - keepout / 2.0, tile_y + tile_size + keepout / 2.0 + 3.0, tile_x + tile_size + keepout / 2.0, tile_y + tile_size + keepout / 2.0 + 3.0, pitch=fence_pitch)
-        via_cols = 2 + (1 if tile.local_density > 1.08 else 0)
-        via_rows = 2 + (1 if tile.shield_strength > 0.82 else 0)
+        extra_via_cols = 1 if tile.local_density > 1.08 else 0
+        extra_via_rows = 1 if tile.shield_strength > 0.82 else 0
+        if via_density_scale < 0.95:
+            if extra_via_cols and tile.qubit_id % 2 == 1:
+                extra_via_cols = 0
+            if extra_via_rows and tile.qubit_id % 3 == 1:
+                extra_via_rows = 0
+        via_cols = 2 + extra_via_cols
+        via_rows = 2 + extra_via_rows
         via_count += _add_via_array(bundle, f"via1_ctrl_{tile.qubit_id}", tile_x + 4.0, tile_y + 4.0, via_cols, via_rows, 5.0, 2.0, "VIA1")
         via_count += _add_via_array(bundle, f"via2_res_{tile.qubit_id}", tile_x + tile_size - 14.0, tile_y + 4.0, via_cols, via_rows, 5.0, 2.0, "VIA2")
         via_count += _add_via_array(bundle, f"via3_rd_{tile.qubit_id}", tile_x + 4.0, tile_y + tile_size - 14.0, via_cols, via_rows, 5.0, 2.0, "VIA3")
@@ -627,10 +1070,28 @@ def generate_layout(
                 if op is not None:
                     bundle.labels.append(_label(f"MS {op.start_ns:.0f}-{op.end_ns:.0f}ns", target[0] - 22.0, mid_y - 6.0, 10.0, "FACTORY"))
 
-    fill_count += _add_fill_region(bundle, "fill_top_left", 250.0, 600.0, core_x - 340.0, max(240.0, core_y - 760.0))
-    fill_count += _add_fill_region(bundle, "fill_top_right", core_x + array_width_um + 80.0, 600.0, die_width_um - (core_x + array_width_um + 330.0), max(240.0, core_y - 760.0))
-    fill_count += _add_fill_region(bundle, "fill_bottom_left", 250.0, core_y + array_height_um + 300.0, core_x - 340.0, die_height_um - (core_y + array_height_um + 610.0))
-    fill_count += _add_fill_region(bundle, "fill_bottom_right", core_x + array_width_um + 80.0, core_y + array_height_um + 300.0, die_width_um - (core_x + array_width_um + 330.0), die_height_um - (core_y + array_height_um + 610.0))
+    density_before_fill = recompute_layout_density(bundle, candidate, include_fill=False)
+    power_mesh_reinforcement = _reinforce_power_mesh(
+        bundle,
+        candidate,
+        metrics,
+        topology_plan,
+        core_x=core_x,
+        core_y=core_y,
+        array_width_um=array_width_um,
+        array_height_um=array_height_um,
+    )
+    via_count += int(power_mesh_reinforcement.get("added_via_count", 0))
+
+    fill_pitch = 120.0 * fill_pitch_scale
+    fill_count += _add_fill_region(bundle, "fill_top_left", 250.0, 600.0, core_x - 340.0, max(240.0, core_y - 760.0), pitch=fill_pitch)
+    fill_count += _add_fill_region(bundle, "fill_top_right", core_x + array_width_um + 80.0, 600.0, die_width_um - (core_x + array_width_um + 330.0), max(240.0, core_y - 760.0), pitch=fill_pitch)
+    fill_count += _add_fill_region(bundle, "fill_bottom_left", 250.0, core_y + array_height_um + 300.0, core_x - 340.0, die_height_um - (core_y + array_height_um + 610.0), pitch=fill_pitch)
+    fill_count += _add_fill_region(bundle, "fill_bottom_right", core_x + array_width_um + 80.0, core_y + array_height_um + 300.0, die_width_um - (core_x + array_width_um + 330.0), die_height_um - (core_y + array_height_um + 610.0), pitch=fill_pitch)
+    density_after_fill_raw = recompute_layout_density(bundle, candidate, include_fill=True)
+    trimmed_fill_count, density_after_fill = _trim_fill_to_density_limit(bundle, candidate, density_limit=1.0)
+    fill_count = max(fill_count - trimmed_fill_count, 0)
+    power_mesh_analysis = power_mesh_reinforcement.get("post") or estimate_power_mesh_ir_drop(bundle, candidate, metrics)
 
     bundle.labels.extend(
         [
@@ -653,6 +1114,25 @@ def generate_layout(
         "via_count": via_count,
         "shield_fence_count": fence_count,
         "fill_count": fill_count,
+        "laser_count": laser_count,
+        "laser_driver_count": laser_driver_count,
+        "performance_profile": {
+            "fence_pitch_scale": fence_pitch_scale,
+            "fill_pitch_scale": fill_pitch_scale,
+            "via_density_scale": via_density_scale,
+        },
+        "density_recompute": {
+            "before_fill": density_before_fill,
+            "after_fill_raw": density_after_fill_raw,
+            "after_fill": density_after_fill,
+            "fill_feedback": {
+                "density_limit": 1.0,
+                "trimmed_fill_shapes": trimmed_fill_count,
+                "triggered": trimmed_fill_count > 0,
+            },
+        },
+        "power_mesh_analysis": power_mesh_analysis,
+        "power_mesh_reinforcement": power_mesh_reinforcement,
         "placement_score": placement.placement_score,
         "placement_mean_offset_um": placement.mean_offset_um,
         "placement_bus_loads": placement.optical_bus_loads,
@@ -678,8 +1158,26 @@ def generate_layout(
         "via_count": via_count,
         "shield_fence_count": fence_count,
         "fill_count": fill_count,
+        "laser_count": laser_count,
         "placement_score": placement.placement_score,
         "layout_complexity_score": topology_plan.layout_complexity_score,
+        "density_window_um": density_after_fill["window_size_um"],
+        "density_window_origin_x_um": density_after_fill["window_origin_x_um"],
+        "density_window_origin_y_um": density_after_fill["window_origin_y_um"],
+        "density_window_normalized_to_cell_pitch": density_after_fill["normalized_to_cell_pitch"],
+        "density_min_before_fill": density_before_fill["density_min"],
+        "density_max_before_fill": density_before_fill["density_max"],
+        "density_max_after_fill_raw": density_after_fill_raw["density_max"],
+        "density_min_after_fill": density_after_fill["density_min"],
+        "density_max_after_fill": density_after_fill["density_max"],
+        "metal_density_limit": 1.0,
+        "metal_density_max": density_after_fill["density_max"],
+        "metal_density_pass": density_after_fill["density_max"] <= 1.0,
+        "worst_ir_drop_mV": power_mesh_analysis["worst_drop_mV"],
+        "ir_drop_drc_limit_mV": 200.0,
+        "power_mesh_nodes": power_mesh_analysis["mesh_nodes"],
+        "power_mesh_reinforced": power_mesh_reinforcement["triggered"],
+        "ir_drop_penalty_threshold_mV": power_mesh_reinforcement["threshold_mV"],
         "logical_patches": len(qec_plan.patches) if qec_plan else 0,
         "magic_state_factories": len(qec_plan.magic_state_factories) if qec_plan else 0,
         "logical_schedule_ops": len(qec_plan.logical_schedule) if qec_plan else 0,
