@@ -2,17 +2,30 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from .advanced_sim import AdvancedRefinementResult, LayoutParasiticSummary
-from .layout_validation import LayoutConsistencySummary
+from .compute_backend import resolve_compute_backend
+from .layout_validation import DesignVsLayoutResult, LayoutConsistencySummary
 from .optimizer import OptimizationResult
 from .papers import PaperKnowledge
 from .qec import QECPlan
 from .requirements import RequirementBundle
-from .signoff import SignoffManifest
+from .signoff import SignoffManifest, SignoffReport
 from .simulator import CandidateDesign, SimulationMetrics
 from .simulator import MonteCarloSummary
 from .spec import DesignSpec
+
+
+def _json_default(value: Any) -> Any:
+    item = getattr(value, "item", None)
+    if callable(item):
+        return item()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
+def _json_dumps(payload: Any, *, ensure_ascii: bool = True, indent: int | None = None) -> str:
+    return json.dumps(payload, ensure_ascii=ensure_ascii, indent=indent, default=_json_default)
 
 
 def _candidate_table(candidate: CandidateDesign) -> str:
@@ -43,8 +56,13 @@ def build_report(
     advanced_refinement: AdvancedRefinementResult,
     layout_parasitics: LayoutParasiticSummary,
     layout_consistency: LayoutConsistencySummary,
+    design_vs_layout: DesignVsLayoutResult | None = None,
     signoff_manifest: SignoffManifest | None = None,
     handoff_bundle: dict[str, Any] | None = None,
+    signoff_report: SignoffReport | None = None,
+    quality_profile: dict[str, Any] | None = None,
+    layout_exploration: dict[str, Any] | None = None,
+    feasibility_precheck: dict[str, Any] | None = None,
 ) -> str:
     best = selected_candidate
     metrics = selected_metrics
@@ -79,14 +97,14 @@ def build_report(
 15. Yield: `Y = exp(-rho_defect * area) * exp(-k_via * N_via) * exp(-0.25 * DRC)`
 16. Control loop: `G_cl(s) = K*wn^2 / (s^2 + 2*zeta*wn*s + wn^2)` with extracted bandwidth and phase margin proxies
 17. Phase noise proxy: `sigma_t = sqrt(integral S_phi(f) df) / (2*pi*f0)`
-18. IR-drop proxy: solve `G * V = I` on a sparse power-grid and measure worst-case `Delta V`
+18. IR-drop solve: solve `G * V = I` on the extracted sparse power-grid topology and measure worst-case `Delta V`
 19. Logical error rate: `p_L = alpha * (p_phys / p_th)^((d+1)/2)` for sub-threshold QEC operation
 20. Physical qubits per logical: `N_phys/logical ~= k_code(d)` with code-family dependent scaling
 21. Decoder locality proxy: `S_loc ~ 1 - cluster_penalty - avg_surgery_length / scale`
 22. Magic-state throughput: `R_ms ~ N_factory / ((a + b*d) * t_logical)`
 23. Bell-pair fidelity proxy: `F_bell ~ 0.54*F_ro + 0.22*exp(-latency/T2) + 0.24*eta_opt*I_2photon`
 24. Decoder failure proxy: `p_dec ~ p_dep + 0.6*p_meas + 0.4*p_corr + p_logical`
-25. Global objective: `Score = sum(w_i * score_i) + 0.08 * robustness - penalties`
+25. Global objective: `Score = sum(w_i * score_i) + 0.08 * robustness - penalties - hard(IR_drop > threshold)`
 """.strip()
     requirements_section = "- No natural-language requirement bundle attached."
     if requirements_bundle:
@@ -95,10 +113,62 @@ def build_report(
                 f"- Source: `{requirements_bundle.source}`",
                 f"- Model: `{requirements_bundle.model}`",
                 f"- Parse confidence: `{requirements_bundle.parse_confidence:.2f}`",
+                f"- Ollama endpoint: `{requirements_bundle.ollama_endpoint}`",
+                f"- Ollama runtime ready / model ready / auto-started / auto-pulled: `{requirements_bundle.ollama_runtime_ready}` / `{requirements_bundle.ollama_model_available}` / `{requirements_bundle.ollama_started_local_service}` / `{requirements_bundle.ollama_model_pulled}`",
+                f"- Ollama model loaded / auth mode: `{requirements_bundle.ollama_model_loaded}` / `{requirements_bundle.ollama_auth_mode}`",
                 f"- Goals: `{json.dumps(requirements_bundle.goals, ensure_ascii=False)}`",
                 f"- Constraints: `{json.dumps(requirements_bundle.constraints, ensure_ascii=False)}`",
                 f"- Requirement layers: `{json.dumps(requirements_bundle.layers.to_dict(), ensure_ascii=False)}`",
                 f"- Layout focus: `{json.dumps(requirements_bundle.layout_focus, ensure_ascii=False)}`",
+            ]
+        )
+
+    compute_backend = resolve_compute_backend()
+    compute_section = "\n".join(
+        [
+            f"- Engine: `{compute_backend.engine}`",
+            f"- Device: `{compute_backend.device}`",
+            f"- GPU enabled: `{compute_backend.gpu_enabled}`",
+            f"- Reason: `{compute_backend.reason}`",
+        ]
+    )
+
+    quality_section = "- Standard search depth used."
+    if quality_profile is not None:
+        quality_section = "\n".join(
+            [
+                f"- Mode: `{quality_profile.get('mode')}`",
+                f"- Search rounds: `{quality_profile.get('search_rounds')}`",
+                f"- Effective generations / beam / mutations: `{quality_profile.get('effective_generations')}` / `{quality_profile.get('effective_beam_width')}` / `{quality_profile.get('effective_mutations_per_parent')}`",
+                f"- Effective MC trials / advanced top-k: `{quality_profile.get('effective_monte_carlo_trials')}` / `{quality_profile.get('effective_advanced_top_k')}`",
+                f"- Placement samples / dense trials: `{quality_profile.get('placement_samples')}` / `{quality_profile.get('dense_trials')}`",
+                f"- Auto paper crawl: `{quality_profile.get('auto_crawl_papers')}`",
+            ]
+        )
+
+    feasibility_section = "- Early feasibility pre-check unavailable."
+    if feasibility_precheck is not None:
+        family_lines = [
+            f"- `{item['code_family']}`: d=`{item['recommended_distance']}` | required qubits=`{item['estimated_total_required_qubits']}` | projected logical error=`{item['projected_logical_error_rate']:.3e}` | qubit/error feasible=`{item['meets_qubit_budget']}`/`{item['meets_error_budget']}`"
+            for item in feasibility_precheck.get("families", [])[:3]
+        ]
+        feasibility_section = "\n".join(
+            [
+                f"- Estimated physical error rate: `{feasibility_precheck.get('estimated_physical_error_rate', 0.0):.3e}`",
+                f"- Requested target qubits / logicals: `{feasibility_precheck.get('requested_target_qubits')}` / `{feasibility_precheck.get('requested_target_logical_qubits')}`",
+                f"- Warnings: `{json.dumps(feasibility_precheck.get('warnings', []), ensure_ascii=False)}`",
+                *family_lines,
+            ]
+        )
+
+    layout_exploration_section = "- Layout exploration summary unavailable."
+    if layout_exploration is not None:
+        stages = layout_exploration.get("stages", [])
+        layout_exploration_section = "\n".join(
+            [
+                f"- Selected candidate key: `{layout_exploration.get('selected_candidate_key')}`",
+                f"- Selected topology variant: `{layout_exploration.get('selected_variant')}`",
+                f"- Explored layout stages: `{len(stages)}`",
             ]
         )
 
@@ -113,7 +183,43 @@ def build_report(
             f"- Recommended pitch (um): `{paper_knowledge.recommended_pitch_um:.2f}`",
             f"- Topic counts: `{json.dumps(paper_knowledge.topic_counts)}`",
         ]
+        if result.paper_bias_audit:
+            paper_lines.append(f"- Bias audit warnings: `{json.dumps(result.paper_bias_audit.get('warnings', []), ensure_ascii=False)}`")
         paper_section = "\n".join(paper_lines)
+
+    paper_provenance_section = "- No paper-seed provenance attached."
+    if result.seed_provenance:
+        applied_bindings = []
+        for entry in result.seed_provenance[:6]:
+            for binding in entry.get("paper_recommendation_bindings", []):
+                if binding.get("applied_in_seed"):
+                    applied_bindings.append(
+                        {
+                            "candidate_key": entry.get("candidate_key"),
+                            "parameter": binding.get("parameter"),
+                            "candidate_value": binding.get("candidate_value"),
+                            "recommended_value": binding.get("recommended_value"),
+                        }
+                    )
+        paper_provenance_section = "\n".join(
+            [
+                f"- Seed provenance entries: `{len(result.seed_provenance)}`",
+                f"- Sample provenance: `{json.dumps(result.seed_provenance[:4], ensure_ascii=False)}`",
+                f"- Applied recommendation bindings: `{json.dumps(applied_bindings[:6], ensure_ascii=False)}`",
+            ]
+        )
+
+    paper_bias_section = "- Paper bias audit unavailable."
+    if result.paper_bias_audit:
+        paper_bias_section = "\n".join(
+            [
+                f"- Topic counts: `{json.dumps(result.paper_bias_audit.get('topic_counts', {}), ensure_ascii=False)}`",
+                f"- Architecture counts: `{json.dumps(result.paper_bias_audit.get('architecture_counts', {}), ensure_ascii=False)}`",
+                f"- Actual architecture ratios: `{json.dumps(result.paper_bias_audit.get('actual_architecture_ratios', {}), ensure_ascii=False)}`",
+                f"- Expected architecture ratios: `{json.dumps(result.paper_bias_audit.get('expected_architecture_ratios', {}), ensure_ascii=False)}`",
+                f"- Warnings: `{json.dumps(result.paper_bias_audit.get('warnings', []), ensure_ascii=False)}`",
+            ]
+        )
 
     neural_section = "- No frozen neural surrogate data attached."
     if selected_ranked and selected_ranked.neural_signals:
@@ -134,16 +240,18 @@ def build_report(
     world_model_section = "- No world-model rollout attached."
     if selected_ranked and getattr(selected_ranked, "world_model_signals", None):
         world_model = selected_ranked.world_model_signals
-        world_model_section = "\n".join(
-            [
-                f"- Terminal quality: `{world_model.terminal_quality:.4f}`",
-                f"- Schedule / logical / routing / thermal pressure: `{world_model.schedule_pressure:.4f}` / `{world_model.logical_pressure:.4f}` / `{world_model.routing_pressure:.4f}` / `{world_model.thermal_pressure:.4f}`",
-                f"- Confidence: `{world_model.confidence:.4f}`",
-                f"- Recommended qubit / factory-lane delta: `{world_model.recommended_qubit_delta}` / `{world_model.recommended_factory_lane_delta}`",
-                f"- Recommended pitch delta (um): `{world_model.recommended_pitch_delta_um:.3f}`",
-                f"- Rollout actions: `{json.dumps([step['action'] for step in [item.to_dict() for item in world_model.rollout]])}`",
-            ]
-        )
+        world_model_lines = [
+            f"- Terminal quality: `{world_model.terminal_quality:.4f}`",
+            f"- Schedule / logical / routing / thermal pressure: `{world_model.schedule_pressure:.4f}` / `{world_model.logical_pressure:.4f}` / `{world_model.routing_pressure:.4f}` / `{world_model.thermal_pressure:.4f}`",
+            f"- Confidence: `{world_model.confidence:.4f}`",
+            f"- Recommended qubit / factory-lane delta: `{world_model.recommended_qubit_delta}` / `{world_model.recommended_factory_lane_delta}`",
+            f"- Recommended pitch delta (um): `{world_model.recommended_pitch_delta_um:.3f}`",
+            f"- Rollout actions: `{json.dumps([step['action'] for step in [item.to_dict() for item in world_model.rollout]])}`",
+        ]
+        active_feedback = getattr(result, "seed_feedback", {}) or {}
+        if active_feedback.get("active"):
+            world_model_lines.append(f"- Bound next-round seed feedback: `{json.dumps(active_feedback, ensure_ascii=False)}`")
+        world_model_section = "\n".join(world_model_lines)
 
     topology_section = "- Topology plan unavailable."
     if advanced_refinement.bundles:
@@ -168,8 +276,11 @@ def build_report(
                 f"- Code distance: `{selected_qec_plan.code_distance}`",
                 f"- Target / achievable logical qubits: `{selected_qec_plan.target_logical_qubits}` / `{selected_qec_plan.achievable_logical_qubits}`",
                 f"- Physical qubits per logical: `{selected_qec_plan.physical_qubits_per_logical}`",
+                f"- Physical qubits per target logical: `{selected_qec_plan.physical_qubits_per_target_logical:.2f}`",
+                f"- Estimated required total qubits: `{selected_qec_plan.estimated_required_total_qubits}`",
                 f"- Physical error rate: `{selected_qec_plan.physical_error_rate:.6e}`",
                 f"- Logical error rate: `{selected_qec_plan.logical_error_rate:.6e}`",
+                f"- Distance escalation triggered / candidate: `{selected_qec_plan.escalation_rule_triggered}` / `{selected_qec_plan.escalated_distance_candidate}`",
                 f"- Syndrome / decoder / logical cycle ns: `{selected_qec_plan.syndrome_cycle_ns:.2f}` / `{selected_qec_plan.decoder_latency_ns:.2f}` / `{selected_qec_plan.logical_cycle_ns:.2f}`",
                 f"- Logical success probability: `{selected_qec_plan.logical_success_probability:.6f}`",
                 f"- Decoder locality score: `{selected_qec_plan.decoder_locality_score:.4f}`",
@@ -179,6 +290,7 @@ def build_report(
                 f"- Factory / decoder utilization: `{selected_qec_plan.factory_utilization:.4f}` / `{selected_qec_plan.decoder_utilization:.4f}`",
                 f"- Logical scheduled ops / factory batches: `{len(selected_qec_plan.logical_schedule)}` / `{len(selected_qec_plan.factory_timelines)}`",
                 f"- Violations: `{json.dumps(selected_qec_plan.violations)}`",
+                f"- Feasibility warnings: `{json.dumps(selected_qec_plan.feasibility_warnings, ensure_ascii=False)}`",
             ]
         )
 
@@ -232,6 +344,15 @@ def build_report(
                 f"- Report SHA / GDS SHA: `{signoff_manifest.report_sha256[:12]}` / `{signoff_manifest.gds_sha256[:12]}`",
                 f"- Artifact registry: `{signoff_manifest.artifact_registry_path}`",
                 f"- Handoff manifest: `{signoff_manifest.handoff_bundle_path}`",
+                f"- Signoff version: `{signoff_manifest.signoff_version}`",
+                f"- Signoff schema: `{signoff_manifest.signoff_schema_path}`",
+                f"- Timestamp: `{signoff_manifest.timestamp}`",
+                f"- Gates: `{signoff_manifest.gate_count}` total, `{signoff_manifest.gates_passed}` passed, `{signoff_manifest.gates_failed}` failed",
+                f"- Critical gates pass: `{signoff_manifest.critical_gates_pass}`",
+                f"- DRC all pass: `{signoff_manifest.drc_all_pass}`",
+                f"- Design vs layout match: `{signoff_manifest.design_vs_layout_match}`",
+                f"- Handoff authorized: `{signoff_manifest.handoff_authorized}`",
+                f"- Handoff quarantined / flag: `{signoff_manifest.handoff_quarantined}` / `{signoff_manifest.quarantine_flag}`",
             ]
         )
 
@@ -242,9 +363,50 @@ def build_report(
                 f"- Handoff package dir: `{handoff_bundle.get('package_dir')}`",
                 f"- Handoff package manifest: `{handoff_bundle.get('package_manifest')}`",
                 f"- Handoff package SHA: `{str(handoff_bundle.get('package_sha256', ''))[:12]}`",
+                f"- Quarantined / reason: `{handoff_bundle.get('quarantined')}` / `{handoff_bundle.get('quarantine_reason')}`",
                 f"- Immutable artifacts: `{json.dumps(handoff_bundle.get('immutable_artifacts', {}))}`",
             ]
         )
+
+    design_vs_layout_section = "- Design-vs-layout diff unavailable."
+    if design_vs_layout is not None:
+        constraint_diff_rows = []
+        sim_mismatch = next((item for item in design_vs_layout.mismatches if item.check_name == "simulation_constraints"), None)
+        if sim_mismatch is not None:
+            for diff in sim_mismatch.details.get("constraint_diffs", []):
+                constraint_diff_rows.append(
+                    f"| {diff['name']} | {diff['comparison']} | {diff['target']:.6g} | {diff['actual']:.6g} | {diff['delta']:.6g} | {diff['violated']} |"
+                )
+        constraint_diff_table = "\n".join(constraint_diff_rows) if constraint_diff_rows else "| none | - | - | - | - | - |"
+        design_vs_layout_section = "\n".join(
+            [
+                f"- All match: `{design_vs_layout.all_match}`",
+                f"- Checks performed: `{design_vs_layout.checks_performed}`",
+                f"- Mismatches: `{json.dumps([item.to_dict() for item in design_vs_layout.mismatches], ensure_ascii=False)}`",
+                "",
+                "| Parameter | Rule | Target | Actual | Delta | Violated |",
+                "| --- | --- | --- | --- | --- | --- |",
+                constraint_diff_table,
+            ]
+        )
+
+    signoff_gates_section = "- Signoff gate report unavailable."
+    if signoff_report is not None:
+        gate_rows = []
+        for gate in signoff_report.gates:
+            status = "PASS" if gate.passed else "FAIL"
+            gate_rows.append(f"| {status} | {gate.gate_name} | {gate.category} | {gate.severity} | {gate.message} |")
+        gate_table = "\n".join(gate_rows) if gate_rows else "| - | - | - | - | - |"
+        signoff_gates_section = "\n".join([
+            f"- Signoff version: `{signoff_report.signoff_version}`",
+            f"- All gates pass: `{signoff_report.all_gates_pass}`",
+            f"- Critical gates pass: `{signoff_report.critical_gates_pass}`",
+            f"- **Handoff authorized: `{signoff_report.handoff_authorized}`**",
+            "",
+            "| Status | Gate | Category | Severity | Message |",
+            "| --- | --- | --- | --- | --- |",
+            gate_table,
+        ])
 
     advanced_rows = []
     for bundle in advanced_refinement.bundles:
@@ -263,6 +425,18 @@ def build_report(
 - Target qubits: `{spec.target_qubits}`
 - Implemented qubits: `{best.qubits}`
 - Target logical qubits: `{spec.target_logical_qubits}`
+
+## Compute Backend
+
+{compute_section}
+
+## Quality Profile
+
+{quality_section}
+
+## Feasibility Pre-check
+
+{feasibility_section}
 
 ## Algorithm
 
@@ -290,6 +464,14 @@ def build_report(
 
 {paper_section}
 
+## Paper Provenance
+
+{paper_provenance_section}
+
+## Paper Bias Audit
+
+{paper_bias_section}
+
 ## Frozen Neural Surrogate
 
 {neural_section}
@@ -306,6 +488,10 @@ def build_report(
 
 {topology_section}
 
+## Layout Exploration
+
+{layout_exploration_section}
+
 ## QEC And Logical Qubits
 
 {qec_section}
@@ -321,6 +507,14 @@ def build_report(
 ## Artifact Management
 
 {artifact_section}
+
+## Signoff Gates
+
+{signoff_gates_section}
+
+## Design Vs Layout Diff
+
+{design_vs_layout_section}
 
 ## Best Candidate Parameters
 
@@ -388,7 +582,7 @@ def build_report(
 ## Search Log
 
 ```json
-{json.dumps(result.search_log, indent=2)}
+{_json_dumps(result.search_log, indent=2)}
 ```
 """
 
