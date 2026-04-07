@@ -2,6 +2,8 @@
 
 End-to-end Python EDA pipeline that takes an NV-center QSoC design spec, searches multiple architecture families, evaluates physics and implementation tradeoffs, then emits floorplan/layout artifacts.
 
+<img width="482" height="489" alt="Image" src="https://github.com/user-attachments/assets/ff1e4acc-82af-4b69-936b-4cabacc9f3e9" />
+
 ## Features
 
 - Normalizes user design specs for NV-center based QSoC targets.
