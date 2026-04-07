@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .compute_backend import get_torch_module, resolve_compute_backend
 from .dense_placement import FastDenseSignals
 from .papers import PaperKnowledge
 from .requirements import RequirementBundle
@@ -36,10 +37,33 @@ _GRAPH_ADJ = np.array(
 _GRAPH_ADJ = _GRAPH_ADJ / _GRAPH_ADJ.sum(axis=1, keepdims=True)
 _OUT_W = _RNG.normal(0.0, 0.24, size=(32, 10))
 _OUT_B = _RNG.normal(0.0, 0.04, size=(10,))
+_TORCH_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _sigmoid(value: float) -> float:
     return 1.0 / (1.0 + math.exp(-max(min(value, 30.0), -30.0)))
+
+
+def _torch_constants(device: str) -> dict[str, Any] | None:
+    torch = get_torch_module()
+    if torch is None:
+        return None
+    cached = _TORCH_CACHE.get(device)
+    if cached is None:
+        cached = {
+            "W1": torch.as_tensor(_W1, dtype=torch.float32, device=device),
+            "B1": torch.as_tensor(_B1, dtype=torch.float32, device=device),
+            "W2": torch.as_tensor(_W2, dtype=torch.float32, device=device),
+            "B2": torch.as_tensor(_B2, dtype=torch.float32, device=device),
+            "GRAPH_SELF": torch.as_tensor(_GRAPH_SELF, dtype=torch.float32, device=device),
+            "GRAPH_MSG": torch.as_tensor(_GRAPH_MSG, dtype=torch.float32, device=device),
+            "GRAPH_BIAS": torch.as_tensor(_GRAPH_BIAS, dtype=torch.float32, device=device),
+            "GRAPH_ADJ": torch.as_tensor(_GRAPH_ADJ, dtype=torch.float32, device=device),
+            "OUT_W": torch.as_tensor(_OUT_W, dtype=torch.float32, device=device),
+            "OUT_B": torch.as_tensor(_OUT_B, dtype=torch.float32, device=device),
+        }
+        _TORCH_CACHE[device] = cached
+    return cached
 
 
 @dataclass(slots=True)
@@ -169,6 +193,15 @@ def _feature_vector(
 def _input_projection(features: np.ndarray) -> np.ndarray:
     if features.shape[0] != _INPUT_FEATURES:
         raise ValueError(f"expected {_INPUT_FEATURES} features, got {features.shape[0]}")
+    backend = resolve_compute_backend()
+    constants = _torch_constants(backend.device) if backend.engine == "torch" and backend.gpu_enabled else None
+    torch = get_torch_module() if constants is not None else None
+    if torch is not None and constants is not None:
+        tensor = torch.as_tensor(features, dtype=torch.float32, device=backend.device)
+        enriched = torch.cat([tensor, torch.sin(torch.pi * tensor), torch.cos(torch.pi * tensor)], dim=0)
+        hidden = torch.tanh(enriched @ constants["W1"] + constants["B1"])
+        hidden = torch.tanh(hidden @ constants["W2"] + constants["B2"])
+        return hidden.detach().cpu().numpy()
     enriched = np.concatenate([features, np.sin(math.pi * features), np.cos(math.pi * features)], axis=0)
     hidden = np.tanh(enriched @ _W1 + _B1)
     hidden = np.tanh(hidden @ _W2 + _B2)
@@ -176,6 +209,24 @@ def _input_projection(features: np.ndarray) -> np.ndarray:
 
 
 def _graph_projection(features: np.ndarray, hidden: np.ndarray) -> np.ndarray:
+    backend = resolve_compute_backend()
+    constants = _torch_constants(backend.device) if backend.engine == "torch" and backend.gpu_enabled else None
+    torch = get_torch_module() if constants is not None else None
+    if torch is not None and constants is not None:
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=backend.device)
+        hidden_tensor = torch.as_tensor(hidden, dtype=torch.float32, device=backend.device)
+        nodes = torch.zeros((6, 8), dtype=torch.float32, device=backend.device)
+        nodes[0] = torch.stack([feature_tensor[10], feature_tensor[12], feature_tensor[13], feature_tensor[14], hidden_tensor[0], hidden_tensor[1], hidden_tensor[2], hidden_tensor[3]])
+        nodes[1] = torch.stack([feature_tensor[17], feature_tensor[18], feature_tensor[33], feature_tensor[44], hidden_tensor[4], hidden_tensor[5], hidden_tensor[6], hidden_tensor[7]])
+        nodes[2] = torch.stack([feature_tensor[5], feature_tensor[26], feature_tensor[28], feature_tensor[35], hidden_tensor[8], hidden_tensor[9], hidden_tensor[10], hidden_tensor[11]])
+        nodes[3] = torch.stack([feature_tensor[3], feature_tensor[31], feature_tensor[24], feature_tensor[34], hidden_tensor[12], hidden_tensor[13], hidden_tensor[14], hidden_tensor[15]])
+        nodes[4] = torch.stack([feature_tensor[36], feature_tensor[37], feature_tensor[38], feature_tensor[39], hidden_tensor[16], hidden_tensor[17], hidden_tensor[18], hidden_tensor[19]])
+        nodes[5] = torch.stack([feature_tensor[32], feature_tensor[40], feature_tensor[41], feature_tensor[42], hidden_tensor[20], hidden_tensor[21], hidden_tensor[22], hidden_tensor[23]])
+        for _ in range(3):
+            messages = constants["GRAPH_ADJ"] @ nodes @ constants["GRAPH_MSG"]
+            self_term = nodes @ constants["GRAPH_SELF"]
+            nodes = torch.tanh(messages + self_term + constants["GRAPH_BIAS"])
+        return nodes.detach().cpu().numpy()
     nodes = np.zeros((6, 8), dtype=float)
     nodes[0] = np.array([features[10], features[12], features[13], features[14], hidden[0], hidden[1], hidden[2], hidden[3]])
     nodes[1] = np.array([features[17], features[18], features[33], features[44], hidden[4], hidden[5], hidden[6], hidden[7]])
@@ -202,8 +253,15 @@ def evaluate_frozen_neural_surrogate(
     features = _feature_vector(spec, candidate, metrics, dense_signals, paper_knowledge, requirements_bundle)
     hidden = _input_projection(features)
     nodes = _graph_projection(features, hidden)
+    backend = resolve_compute_backend()
     pooled = np.concatenate([hidden[:16], np.mean(nodes, axis=0), np.max(nodes, axis=0)], axis=0)
-    logits = pooled @ _OUT_W + _OUT_B
+    constants = _torch_constants(backend.device) if backend.engine == "torch" and backend.gpu_enabled else None
+    torch = get_torch_module() if constants is not None else None
+    if torch is not None and constants is not None:
+        pooled_tensor = torch.as_tensor(pooled, dtype=torch.float32, device=backend.device)
+        logits = (pooled_tensor @ constants["OUT_W"] + constants["OUT_B"]).detach().cpu().numpy()
+    else:
+        logits = pooled @ _OUT_W + _OUT_B
 
     prototype_affinity = 0.5
     latent_head = pooled[:12]
