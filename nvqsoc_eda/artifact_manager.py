@@ -48,6 +48,9 @@ class HandoffBundle:
     package_manifest: str
     immutable_artifacts: dict[str, str]
     package_sha256: str
+    quarantined: bool = False
+    quarantine_flag: str = ""
+    quarantine_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -77,6 +80,7 @@ def _role_for_name(name: str) -> tuple[str, str]:
         ("qec_plan.json", ("qec_plan", "qec")),
         ("layout_consistency.json", ("layout_consistency", "signoff")),
         ("layout_parasitics.json", ("layout_parasitics", "signoff")),
+        ("signoff_schema.json", ("signoff_schema", "signoff")),
         ("signoff_manifest.json", ("signoff_manifest", "signoff")),
         ("optimization.json", ("optimization", "optimization")),
         ("normalized_spec.json", ("normalized_spec", "input")),
@@ -134,8 +138,15 @@ def write_artifact_registry(output_dir: Path, registry: ArtifactRegistry) -> dic
     return {"artifact_registry": str(path)}
 
 
-def create_handoff_bundle(run_id: str, output_dir: Path, registry: ArtifactRegistry) -> HandoffBundle:
-    package_dir = output_dir / "handoff"
+def create_handoff_bundle(
+    run_id: str,
+    output_dir: Path,
+    registry: ArtifactRegistry,
+    *,
+    quarantined: bool = False,
+    quarantine_reason: str = "",
+) -> HandoffBundle:
+    package_dir = output_dir / ("QUARANTINE" if quarantined else "handoff")
     package_dir.mkdir(parents=True, exist_ok=True)
     immutable_artifacts: dict[str, str] = {}
     selected_roles = {"report", "gds", "oas", "layout_json", "qec_plan", "topology_plan", "signoff_manifest", "artifact_registry"}
@@ -143,15 +154,21 @@ def create_handoff_bundle(run_id: str, output_dir: Path, registry: ArtifactRegis
         if record.role not in selected_roles:
             continue
         source = Path(record.path)
-        immutable_name = f"{run_id}__{source.name}"
+        blocked_suffix = "__BLOCKED" if quarantined else ""
+        immutable_name = f"{run_id}__{source.stem}{blocked_suffix}{source.suffix}"
         destination = package_dir / immutable_name
         shutil.copy2(source, destination)
         immutable_artifacts[record.artifact_id] = str(destination)
         record.immutable_copy = str(destination)
 
-    package_manifest_path = package_dir / f"{run_id}__handoff_manifest.json"
+    manifest_suffix = "__BLOCKED" if quarantined else ""
+    package_manifest_path = package_dir / f"{run_id}__handoff_manifest{manifest_suffix}.json"
     package_payload = {
         "run_id": run_id,
+        "quarantined": quarantined,
+        "quarantine_flag": "QUARANTINE" if quarantined else "",
+        "quarantine_reason": quarantine_reason,
+        "blocked_suffix": "BLOCKED" if quarantined else "",
         "immutable_artifacts": immutable_artifacts,
         "registry": registry.to_dict(),
     }
@@ -163,6 +180,9 @@ def create_handoff_bundle(run_id: str, output_dir: Path, registry: ArtifactRegis
         package_manifest=str(package_manifest_path),
         immutable_artifacts=immutable_artifacts,
         package_sha256=package_sha,
+        quarantined=quarantined,
+        quarantine_flag="QUARANTINE" if quarantined else "",
+        quarantine_reason=quarantine_reason,
     )
 
 
@@ -170,3 +190,118 @@ def write_handoff_bundle(output_dir: Path, bundle: HandoffBundle) -> dict[str, s
     path = output_dir / "handoff_bundle.json"
     path.write_text(json.dumps(bundle.to_dict(), indent=2), encoding="utf-8")
     return {"handoff_bundle": str(path)}
+
+
+# ---------------------------------------------------------------------------
+# Bundle Integrity & Completeness Verification
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class BundleAuditResult:
+    """Result of integrity and completeness verification of a handoff bundle."""
+    integrity_pass: bool
+    completeness_pass: bool
+    overall_pass: bool
+    timestamp: str
+    sha_mismatches: list[dict[str, str]] = field(default_factory=list)
+    missing_artifacts: list[str] = field(default_factory=list)
+    present_artifacts: list[str] = field(default_factory=list)
+    file_not_found: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def verify_bundle_integrity(bundle: HandoffBundle, registry: ArtifactRegistry) -> BundleAuditResult:
+    """Re-compute SHA256 for all immutable artifacts and verify against registry."""
+    from datetime import datetime, timezone
+
+    sha_mismatches: list[dict[str, str]] = []
+    file_not_found: list[str] = []
+
+    # Build lookup from registry
+    registry_sha: dict[str, str] = {}
+    for record in registry.records:
+        if record.immutable_copy:
+            registry_sha[record.immutable_copy] = record.sha256
+        registry_sha[record.path] = record.sha256
+
+    for alias, immutable_path_str in bundle.immutable_artifacts.items():
+        immutable_path = Path(immutable_path_str)
+        if not immutable_path.exists():
+            file_not_found.append(alias)
+            continue
+        actual_sha = _sha256(immutable_path)
+        expected_sha = registry_sha.get(immutable_path_str)
+        if expected_sha is not None and actual_sha != expected_sha:
+            sha_mismatches.append({
+                "artifact_id": alias,
+                "path": immutable_path_str,
+                "expected_sha256": expected_sha,
+                "actual_sha256": actual_sha,
+            })
+
+    integrity_pass = len(sha_mismatches) == 0 and len(file_not_found) == 0
+
+    return BundleAuditResult(
+        integrity_pass=integrity_pass,
+        completeness_pass=True,  # Will be filled by check_bundle_completeness
+        overall_pass=integrity_pass,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        sha_mismatches=sha_mismatches,
+        file_not_found=file_not_found,
+    )
+
+
+def check_bundle_completeness(bundle: HandoffBundle, registry: ArtifactRegistry) -> BundleAuditResult:
+    """Verify that all required roles are present in the handoff bundle."""
+    from datetime import datetime, timezone
+
+    required_roles = {"report", "gds", "layout_json", "signoff_manifest"}
+    optional_roles = {"oas", "qec_plan", "topology_plan", "artifact_registry"}
+
+    present_roles: set[str] = set()
+    for record in registry.records:
+        if record.role in required_roles or record.role in optional_roles:
+            # Check if this artifact is in the immutable bundle
+            if record.artifact_id in bundle.immutable_artifacts:
+                present_roles.add(record.role)
+
+    missing = [role for role in sorted(required_roles) if role not in present_roles]
+    present = sorted(present_roles)
+    completeness_pass = len(missing) == 0
+
+    return BundleAuditResult(
+        integrity_pass=True,  # Not checked here
+        completeness_pass=completeness_pass,
+        overall_pass=completeness_pass,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        missing_artifacts=missing,
+        present_artifacts=present,
+    )
+
+
+def audit_handoff_bundle(bundle: HandoffBundle, registry: ArtifactRegistry) -> BundleAuditResult:
+    """Full audit: integrity + completeness combined."""
+    integrity = verify_bundle_integrity(bundle, registry)
+    completeness = check_bundle_completeness(bundle, registry)
+
+    overall = integrity.integrity_pass and completeness.completeness_pass
+
+    return BundleAuditResult(
+        integrity_pass=integrity.integrity_pass,
+        completeness_pass=completeness.completeness_pass,
+        overall_pass=overall,
+        timestamp=integrity.timestamp,
+        sha_mismatches=integrity.sha_mismatches,
+        missing_artifacts=completeness.missing_artifacts,
+        present_artifacts=completeness.present_artifacts,
+        file_not_found=integrity.file_not_found,
+    )
+
+
+def write_bundle_audit(output_dir: Path, audit: BundleAuditResult) -> dict[str, str]:
+    """Write the bundle audit result to disk."""
+    path = output_dir / "bundle_audit.json"
+    path.write_text(json.dumps(audit.to_dict(), indent=2), encoding="utf-8")
+    return {"bundle_audit": str(path)}
